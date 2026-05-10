@@ -90,10 +90,31 @@ in {
     environment.systemPackages =
       (with pkgs; [
         bashInteractive
+        bubblewrap
         coreutils
+        curl
         direnv
+        fd
+        findutils
+        gawk
+        git
+        gnugrep
+        gnused
+        jq
+        jujutsu
+        less
         nodejs
+        ripgrep
+        tmux
+        tree
+        unzip
+        util-linux
+        vim
+        wget
       ])
+      ++ [
+        (pkgs.python3.withPackages (_ps: []))
+      ]
       ++ cfg.extraGuestPackages pkgs;
 
     programs = {
