@@ -60,9 +60,12 @@ in {
 
     systemd.services.console-getty.enable = false;
 
+    users.groups.users.gid = 100;
+
     users.users.${cfg.username} = {
       isNormalUser = true;
       home = "/home/${cfg.username}";
+      group = "users";
       extraGroups = ["wheel"];
       initialHashedPassword = "";
       uid = 1000;

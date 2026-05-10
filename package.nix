@@ -106,7 +106,7 @@
 
       exec ${pkgs.podman}/bin/podman run \
         --rm -it \
-        --userns=keep-id --user 0:0 \
+        --userns=keep-id:uid=1000,gid=100 --user 0:0 \
         --cap-add=SYS_ADMIN \
         --cap-add=NET_RAW \
         --cap-add=SYS_PTRACE \
