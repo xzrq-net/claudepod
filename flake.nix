@@ -43,8 +43,8 @@
       mkPackage = {
         pkgs,
         username ? "user",
-        stateDir ? "/tmp/claudepod",
-        srcRoot ? "/tmp",
+        stateDir ? null,
+        srcRoot ? null,
         guestSystem ? pkgs.stdenv.hostPlatform.system,
         extraGuestPackages ? (_: []),
         guestModules ? [],
@@ -74,6 +74,20 @@
       in {
         default = claudepod;
         claudepod = claudepod;
+      };
+
+      apps.x86_64-linux = let
+        claudepodPackage = self.packages.x86_64-linux.claudepod;
+      in rec {
+        default = claudepod;
+        claudepod = {
+          type = "app";
+          program = "${claudepodPackage}/bin/claudepod";
+        };
+        gptpod = {
+          type = "app";
+          program = "${claudepodPackage}/bin/gptpod";
+        };
       };
     };
 }

@@ -6,6 +6,8 @@
   srcRoot,
 }: let
   entryScript = import ./entry.nix {inherit pkgs toplevel;};
+  defaultStateDir = if stateDir == null then "" else pkgs.lib.escapeShellArg stateDir;
+  defaultSrcRoot = if srcRoot == null then "" else pkgs.lib.escapeShellArg srcRoot;
 
   image = pkgs.dockerTools.streamLayeredImage {
     name = "claudepod";
@@ -23,8 +25,24 @@
       set -euo pipefail
 
       MODE=${defaultMode}
-      STATE_DIR=${pkgs.lib.escapeShellArg stateDir}
-      SRC_ROOT=${pkgs.lib.escapeShellArg srcRoot}
+      DEFAULT_STATE_DIR=${defaultStateDir}
+      DEFAULT_SRC_ROOT=${defaultSrcRoot}
+
+      if [ -n "''${CLAUDEPOD_STATE_DIR-}" ]; then
+        STATE_DIR="''${CLAUDEPOD_STATE_DIR}"
+      elif [ -n "$DEFAULT_STATE_DIR" ]; then
+        STATE_DIR="$DEFAULT_STATE_DIR"
+      else
+        STATE_DIR="''${XDG_DATA_HOME:-$HOME/.local/share}/claudepod"
+      fi
+
+      if [ -n "''${CLAUDEPOD_SRC_ROOT-}" ]; then
+        SRC_ROOT="''${CLAUDEPOD_SRC_ROOT}"
+      elif [ -n "$DEFAULT_SRC_ROOT" ]; then
+        SRC_ROOT="$DEFAULT_SRC_ROOT"
+      else
+        SRC_ROOT="$HOME/src"
+      fi
       SRC_ROOT="''${SRC_ROOT%/}"
       EXTRA_VOLUMES=()
       while getopts "sv:" opt; do
