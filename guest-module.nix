@@ -88,7 +88,7 @@ in {
       after = ["multi-user.target"];
       wantedBy = ["multi-user.target"];
       serviceConfig = {
-        Type = "idle";
+        Type = "simple";
         StandardInput = "tty";
         StandardOutput = "tty";
         TTYPath = "/dev/console";
@@ -149,6 +149,8 @@ in {
     documentation.enable = false;
 
     networking = {
+      useDHCP = false;
+      firewall.enable = false;
       useHostResolvConf = false;
       resolvconf.enable = false;
     };
