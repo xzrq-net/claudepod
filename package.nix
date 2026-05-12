@@ -6,8 +6,14 @@
   srcRoot,
 }: let
   entryScript = import ./entrypoint.nix {inherit pkgs toplevel;};
-  defaultStateDir = if stateDir == null then "" else pkgs.lib.escapeShellArg stateDir;
-  defaultSrcRoot = if srcRoot == null then "" else pkgs.lib.escapeShellArg srcRoot;
+  defaultStateDir =
+    if stateDir == null
+    then ""
+    else pkgs.lib.escapeShellArg stateDir;
+  defaultSrcRoot =
+    if srcRoot == null
+    then ""
+    else pkgs.lib.escapeShellArg srcRoot;
 
   image = pkgs.dockerTools.streamLayeredImage {
     name = "claudepod";
@@ -105,6 +111,7 @@
         --rm -it \
         --userns=keep-id:uid=1000,gid=100 --user 0:0 \
         --cap-add=SYS_ADMIN \
+        --cap-add=NET_ADMIN \
         --cap-add=NET_RAW \
         --cap-add=SYS_PTRACE \
         --device /dev/fuse \
