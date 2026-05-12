@@ -5,7 +5,7 @@
   stateDir,
   srcRoot,
 }: let
-  entryScript = import ./entry.nix {inherit pkgs toplevel;};
+  entryScript = import ./entrypoint.nix {inherit pkgs toplevel;};
   defaultStateDir = if stateDir == null then "" else pkgs.lib.escapeShellArg stateDir;
   defaultSrcRoot = if srcRoot == null then "" else pkgs.lib.escapeShellArg srcRoot;
 

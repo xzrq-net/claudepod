@@ -16,7 +16,7 @@
     nix-index-database,
     ...
   }: let
-    guestModule = import ./modules/guest.nix {inherit nix-index-database;};
+    guestModule = import ./guest-module.nix {inherit nix-index-database;};
 
     claudepodLib = rec {
       mkGuest = {
@@ -64,7 +64,7 @@
     {
       lib = claudepodLib;
       nixosModules.default = guestModule;
-      homeModules.default = import ./modules/home.nix {inherit self;};
+      homeModules.default = import ./home-manager-module.nix {inherit self;};
     }
     // {
       packages.x86_64-linux = let
