@@ -45,9 +45,10 @@
         case "$opt" in
           s) MODE=shell ;;
           v) EXTRA_VOLUMES+=("$OPTARG") ;;
-          *) echo "Usage: ${name} [-s] [-v path] [-v host:guest] ..." >&2; exit 1 ;;
+          *) echo "Usage: ${name} [-s] [-v path] [-v host:guest] ... [-- command [arg]...]" >&2; exit 1 ;;
         esac
       done
+      shift "$((OPTIND - 1))"
 
       PROJECT_DIR="$(pwd)"
       SRC_PREFIX="$SRC_ROOT/"
@@ -118,7 +119,8 @@
         -e CLAUDEPOD_PROJECT_PATH="$GUEST_PATH" \
         -e CLAUDEPOD_MODE="$MODE" \
         -e CLAUDEPOD_HAS_PROJECT="$NEED_PROJECT_SHARE" \
-        claudepod:latest
+        claudepod:latest \
+        "$@"
     '';
 in
   pkgs.symlinkJoin {

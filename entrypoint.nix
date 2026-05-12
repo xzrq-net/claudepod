@@ -24,6 +24,10 @@ in
     echo "''${CLAUDEPOD_PROJECT_PATH:-/tmp}" > /run/claudepod-project
     echo "''${CLAUDEPOD_MODE:-shell}" > /run/claudepod-mode
     echo "''${CLAUDEPOD_HAS_PROJECT:-false}" > /run/claudepod-has-project
+    : > /run/claudepod-command
+    if [ "$#" -gt 0 ]; then
+      printf '%s\0' "$@" > /run/claudepod-command
+    fi
 
     # Forward selected env vars across the systemd boundary.
     # %q emits bash-quoted output; service reads via `set -a; . file; set +a`.

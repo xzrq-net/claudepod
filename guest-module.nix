@@ -11,10 +11,20 @@
 
     MODE=$(${pkgs.coreutils}/bin/cat /run/claudepod-mode)
     PROJECT=$(${pkgs.coreutils}/bin/cat /run/claudepod-project)
+    COMMAND=()
+    if [ -s /run/claudepod-command ]; then
+      while IFS= read -r -d "" arg; do
+        COMMAND+=("$arg")
+      done < /run/claudepod-command
+    fi
 
     set -a
     . /run/claudepod-env
     set +a
+
+    if [ "''${#COMMAND[@]}" -gt 0 ]; then
+      exec ${pkgs.bashInteractive}/bin/bash --login -c 'cd "$1" && { eval "$(${pkgs.direnv}/bin/direnv export bash)" || true; } && shift && exec "$@"' claudepod "$PROJECT" "''${COMMAND[@]}"
+    fi
 
     case "$MODE" in
       shell)

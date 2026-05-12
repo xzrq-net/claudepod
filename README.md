@@ -34,8 +34,8 @@ nix run github:xzrq-net/claudepod#gptpod
 ## Commands
 
 ```text
-claudepod [-s] [-v path] [-v host:guest]...
-gptpod    [-s] [-v path] [-v host:guest]...
+claudepod [-s] [-v path] [-v host:guest]... [-- command [arg]...]
+gptpod    [-s] [-v path] [-v host:guest]... [-- command [arg]...]
 ```
 
 Options:
@@ -43,6 +43,8 @@ Options:
 - `-s`: start a login shell instead of the default agent mode.
 - `-v path`: mount the same host path at the same guest path.
 - `-v host:guest`: mount a host path at a specific guest path.
+- `command [arg]...`: run this command in the project directory instead of the
+  default agent or shell.
 
 Environment variables:
 
