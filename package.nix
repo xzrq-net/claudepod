@@ -28,17 +28,13 @@
       DEFAULT_STATE_DIR=${defaultStateDir}
       DEFAULT_SRC_ROOT=${defaultSrcRoot}
 
-      if [ -n "''${CLAUDEPOD_STATE_DIR-}" ]; then
-        STATE_DIR="''${CLAUDEPOD_STATE_DIR}"
-      elif [ -n "$DEFAULT_STATE_DIR" ]; then
+      if [ -n "$DEFAULT_STATE_DIR" ]; then
         STATE_DIR="$DEFAULT_STATE_DIR"
       else
         STATE_DIR="''${XDG_DATA_HOME:-$HOME/.local/share}/claudepod"
       fi
 
-      if [ -n "''${CLAUDEPOD_SRC_ROOT-}" ]; then
-        SRC_ROOT="''${CLAUDEPOD_SRC_ROOT}"
-      elif [ -n "$DEFAULT_SRC_ROOT" ]; then
+      if [ -n "$DEFAULT_SRC_ROOT" ]; then
         SRC_ROOT="$DEFAULT_SRC_ROOT"
       else
         SRC_ROOT="$HOME/src"

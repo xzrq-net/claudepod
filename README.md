@@ -46,9 +46,6 @@ Options:
 
 Environment variables:
 
-- `CLAUDEPOD_STATE_DIR`: override the persistent state directory. The guest home
-  is mounted from `$CLAUDEPOD_STATE_DIR/home`.
-- `CLAUDEPOD_SRC_ROOT`: override the host source root mounted at guest `~/src`.
 - `CLAUDE_CODE_*`: forwarded into the guest and through systemd to the agent
   process.
 - `MAX_THINKING_TOKENS`: forwarded the same way when set.
