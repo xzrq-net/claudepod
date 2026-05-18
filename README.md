@@ -12,6 +12,7 @@ ambient credentials like dotfiles. Isolation model:
 - passwordless sudo into container root
 - leaks host details like mount names and hardware info
 - GPT 5.5 couldn't figure out a way to escape isolation
+- host Nix store is fully readable (you don't keep secrets in there, do you?)
 
 The container itself is a few hundred kilobytes. It mounts the host Nix store
 read-only and uses the Nix daemon's local-overlay feature to consult the host
