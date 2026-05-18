@@ -61,6 +61,10 @@
 
       ${pkgs.coreutils}/bin/mkdir -p "$STATE_DIR/home"
 
+      if ! sudo -n nix-db-wal-checkpoint; then
+        echo "warning: failed to checkpoint host Nix database WAL" >&2
+      fi
+
       # Determine guest landing path
       if [[ "$PROJECT_DIR" == "$SRC_PREFIX"* ]]; then
         REL_PATH="''${PROJECT_DIR#$SRC_PREFIX}"
