@@ -78,10 +78,6 @@ Example:
             enable = true;
             username = "me"; # username in container, defaults to Home Manager username
 
-            # Base path "/home/me" defaults to Home Manager home path
-            stateDir = "/home/me/.local/share/claudepod"; # directory to mount as container home
-            srcRoot = "/home/me/src"; # directory to mount as container ~/src
-
             # function from guest `pkgs` to extra packages installed in the guest
             extraGuestPackages = pkgs: [
               pkgs.nodePackages.pnpm
