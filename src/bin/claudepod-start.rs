@@ -25,6 +25,7 @@ struct Args {
 fn main() -> Result<()> {
     let args = Args::parse();
 
+    let command_name = command_name()?;
     let username = compile_env("CLAUDEPOD_USERNAME", option_env!("CLAUDEPOD_USERNAME"))?;
     let image = compile_env("CLAUDEPOD_IMAGE", option_env!("CLAUDEPOD_IMAGE"))?;
     let podman = compile_env("CLAUDEPOD_PODMAN", option_env!("CLAUDEPOD_PODMAN"))?;
@@ -32,7 +33,7 @@ fn main() -> Result<()> {
     let mode = if args.shell {
         "shell"
     } else {
-        default_mode_from_argv0()?
+        default_mode_from_command_name(&command_name)?
     };
 
     let state_dir = state_dir()?;
@@ -79,7 +80,7 @@ fn main() -> Result<()> {
         env_names.push(OsString::from("MAX_THINKING_TOKENS"));
     }
 
-    println!("Starting {}...", command_name());
+    println!("Starting {command_name}...");
     println!("  Host path: {}", project_dir.display());
     println!("  Guest path: {guest_path}");
     println!();
@@ -131,17 +132,23 @@ fn compile_env(name: &'static str, value: Option<&'static str>) -> Result<&'stat
         .ok_or_else(|| anyhow!("{name} was not compiled into this binary"))
 }
 
-fn command_name() -> String {
-    std::env::args_os()
+fn command_name() -> Result<String> {
+    let argv0 = std::env::args_os()
         .next()
-        .and_then(|arg| PathBuf::from(arg).file_name().map(|name| name.to_owned()))
-        .unwrap_or_else(|| OsString::from("claudepod"))
-        .to_string_lossy()
-        .into_owned()
+        .ok_or_else(|| anyhow!("argv[0] is missing"))?;
+    Path::new(&argv0)
+        .file_name()
+        .ok_or_else(|| {
+            anyhow!(
+                "failed to determine command name from {}",
+                Path::new(&argv0).display()
+            )
+        })
+        .map(|name| name.to_string_lossy().into_owned())
 }
 
-fn default_mode_from_argv0() -> Result<&'static str> {
-    match command_name().as_str() {
+fn default_mode_from_command_name(command_name: &str) -> Result<&'static str> {
+    match command_name {
         "claudepod" => Ok("claude"),
         "gptpod" => Ok("codex"),
         other => bail!("unknown command name {other:?}; expected claudepod or gptpod"),
@@ -156,15 +163,7 @@ fn state_dir() -> Result<PathBuf> {
 
 fn src_root() -> Result<PathBuf> {
     let home = std::env::var_os("HOME").ok_or_else(|| anyhow!("HOME is not set"))?;
-    Ok(trim_trailing_slashes(PathBuf::from(home).join("src")))
-}
-
-fn trim_trailing_slashes(path: PathBuf) -> PathBuf {
-    let mut text = path.to_string_lossy().into_owned();
-    while text.len() > 1 && text.ends_with('/') {
-        text.pop();
-    }
-    PathBuf::from(text)
+    Ok(PathBuf::from(home).join("src"))
 }
 
 fn guest_project_path(
@@ -172,13 +171,13 @@ fn guest_project_path(
     src_root: &Path,
     username: &str,
 ) -> Result<(String, bool)> {
-    if let Ok(rel_path) = project_dir.strip_prefix(src_root)
-        && rel_path.components().next().is_some()
-    {
-        return Ok((
-            format!("/home/{username}/src/{}", rel_path.display()),
-            false,
-        ));
+    if let Ok(rel_path) = project_dir.strip_prefix(src_root) {
+        let guest_path = if rel_path.as_os_str().is_empty() {
+            format!("/home/{username}/src")
+        } else {
+            format!("/home/{username}/src/{}", rel_path.display())
+        };
+        return Ok((guest_path, false));
     }
 
     let project_name = project_dir
