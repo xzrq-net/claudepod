@@ -102,7 +102,7 @@ fn main() -> Result<()> {
         "--no-hostname",
         "--no-hosts",
         "--dns=none",
-        "--pids-limit=-1",
+        "--pids-limit=16384",
         "--security-opt",
         "unmask=ALL",
     ]);
