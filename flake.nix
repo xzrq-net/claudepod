@@ -4,11 +4,6 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
-    rust-overlay = {
-      url = "github:oxalica/rust-overlay";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
-
     crane.url = "github:ipetkov/crane";
 
     nix-index-database = {
@@ -20,21 +15,14 @@
   outputs = inputs @ {
     self,
     nixpkgs,
-    rust-overlay,
     crane,
     nix-index-database,
     ...
   }: let
     pkgs = import nixpkgs {
       system = "x86_64-linux";
-      overlays = [rust-overlay.overlays.default];
     };
-    mkRustToolchain = pkgs:
-      pkgs.rust-bin.stable.latest.default.override {
-        extensions = ["clippy" "rust-src" "rustfmt"];
-      };
-    mkCraneLib = pkgs:
-      (crane.mkLib pkgs).overrideToolchain (mkRustToolchain pkgs);
+    mkCraneLib = pkgs: crane.mkLib pkgs;
 
     guestModule = import ./guest-module.nix {inherit nix-index-database;};
 
@@ -138,7 +126,6 @@
       };
 
       devShells.x86_64-linux.default = let
-        rustToolchain = mkRustToolchain pkgs;
         devUsername = "user";
         devGuest = claudepodLib.mkGuest {
           system = pkgs.stdenv.hostPlatform.system;
@@ -155,8 +142,11 @@
           CLAUDEPOD_PODMAN = "${pkgs.podman}/bin/podman";
 
           packages = [
-            rustToolchain
-            pkgs.rust-bin.stable.latest.rust-analyzer
+            pkgs.cargo
+            pkgs.clippy
+            pkgs.rust-analyzer
+            pkgs.rustc
+            pkgs.rustfmt
           ];
         };
     };
