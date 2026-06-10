@@ -1,4 +1,4 @@
-{self}: {
+{mkClaudepod}: {
   config,
   lib,
   pkgs,
@@ -35,7 +35,7 @@ in {
 
   config = lib.mkIf cfg.enable {
     home.packages = [
-      (self.lib.mkPackage {
+      (mkClaudepod {
         inherit pkgs;
         inherit (cfg) username guestSystem extraGuestPackages;
       })

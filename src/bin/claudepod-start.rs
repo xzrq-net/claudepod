@@ -29,10 +29,10 @@ struct Args {
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    let command_name = command_name()?;
-    let username = compile_env("CLAUDEPOD_USERNAME", option_env!("CLAUDEPOD_USERNAME"))?;
-    let image = compile_env("CLAUDEPOD_IMAGE", option_env!("CLAUDEPOD_IMAGE"))?;
-    let podman = compile_env("CLAUDEPOD_PODMAN", option_env!("CLAUDEPOD_PODMAN"))?;
+    let command_name = command_name();
+    let username = std::env::var("CLAUDEPOD_USERNAME").context("CLAUDEPOD_USERNAME is not set")?;
+    let image = std::env::var("CLAUDEPOD_IMAGE").context("CLAUDEPOD_IMAGE is not set")?;
+    let podman = std::env::var("CLAUDEPOD_PODMAN").context("CLAUDEPOD_PODMAN is not set")?;
 
     let mode = if args.shell {
         "shell"
@@ -47,9 +47,9 @@ fn main() -> Result<()> {
 
     let src_root = src_root()?;
     let project_dir = std::env::current_dir().context("failed to get current directory")?;
-    let (guest_path, need_project_share) = guest_project_path(&project_dir, &src_root, username)?;
+    let (guest_path, need_project_share) = guest_project_path(&project_dir, &src_root, &username)?;
 
-    load_image(image, podman)?;
+    load_image(&image, &podman)?;
 
     let mut volumes = vec![
         OsString::from("/nix/store:/nix/store:ro"),
@@ -64,14 +64,13 @@ fn main() -> Result<()> {
         )));
     }
     for spec in args.extra_volumes {
-        if spec.to_string_lossy().contains(':') {
+        if spec.as_encoded_bytes().contains(&b':') {
             volumes.push(spec);
         } else {
-            volumes.push(OsString::from(format!(
-                "{}:{}",
-                spec.to_string_lossy(),
-                spec.to_string_lossy()
-            )));
+            let mut vol = spec.clone();
+            vol.push(":");
+            vol.push(spec);
+            volumes.push(vol);
         }
     }
 
@@ -89,7 +88,7 @@ fn main() -> Result<()> {
     println!("  Guest path: {guest_path}");
     println!();
 
-    let mut command = Command::new(podman);
+    let mut command = Command::new(&podman);
     command.args([
         "run",
         "--rm",
@@ -133,25 +132,13 @@ fn main() -> Result<()> {
     Err(command.exec()).context("failed to exec podman")
 }
 
-fn compile_env(name: &'static str, value: Option<&'static str>) -> Result<&'static str> {
-    value
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| anyhow!("{name} was not compiled into this binary"))
-}
-
-fn command_name() -> Result<String> {
-    let argv0 = std::env::args_os()
-        .next()
-        .ok_or_else(|| anyhow!("argv[0] is missing"))?;
+fn command_name() -> String {
+    let argv0 = std::env::args().next().expect("argv[0] is missing");
     Path::new(&argv0)
         .file_name()
-        .ok_or_else(|| {
-            anyhow!(
-                "failed to determine command name from {}",
-                Path::new(&argv0).display()
-            )
-        })
-        .map(|name| name.to_string_lossy().into_owned())
+        .expect("argv[0] has no file name")
+        .to_string_lossy()
+        .into_owned()
 }
 
 fn default_mode_from_command_name(command_name: &str) -> Result<&'static str> {
@@ -204,22 +191,26 @@ fn load_image(image: &str, podman: &str) -> Result<()> {
         .take()
         .ok_or_else(|| anyhow!("failed to capture image stream stdout"))?;
 
-    let mut podman_load = Command::new(podman)
+    let podman_load = Command::new(podman)
         .args(["load", "-q"])
         .stdin(Stdio::from(image_stdout))
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .with_context(|| format!("failed to start {podman} load"))?;
 
-    let podman_status = podman_load
-        .wait()
+    let podman_output = podman_load
+        .wait_with_output()
         .context("failed to wait for podman load")?;
     let image_status = image_stream
         .wait()
         .context("failed to wait for image stream")?;
 
-    if !podman_status.success() {
-        bail!("podman load failed with {podman_status}");
+    if !podman_output.status.success() {
+        bail!(
+            "podman load failed with {}:\n{}",
+            podman_output.status,
+            String::from_utf8_lossy(&podman_output.stderr).trim_end()
+        );
     }
     if !image_status.success() {
         bail!("image stream failed with {image_status}");

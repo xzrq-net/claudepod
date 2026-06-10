@@ -12,7 +12,7 @@
     };
   };
 
-  outputs = inputs @ {
+  outputs = {
     self,
     nixpkgs,
     crane,
@@ -22,136 +22,93 @@
     pkgs = import nixpkgs {
       system = "x86_64-linux";
     };
-    mkCraneLib = pkgs: crane.mkLib pkgs;
 
     guestModule = import ./guest-module.nix {inherit nix-index-database;};
 
     defaultUsername = "user";
 
-    claudepodLib = rec {
-      mkImage = {
-        pkgs,
-        toplevel,
-      }: let
-        entryScript = import ./entrypoint.nix {inherit pkgs toplevel;};
-      in
-        pkgs.dockerTools.streamLayeredImage {
-          name = "claudepod";
-          tag = "latest";
-          contents = [];
-          includeStorePaths = false;
-          config.Entrypoint = ["${entryScript}"];
-        };
+    mkClaudepod = {
+      pkgs,
+      username,
+      guestSystem ? pkgs.stdenv.hostPlatform.system,
+      extraGuestPackages ? (_: []),
+    }: let
+      guest = nixpkgs.lib.nixosSystem {
+        system = guestSystem;
+        modules = [
+          guestModule
+          {claudepod = {inherit username extraGuestPackages;};}
+        ];
+      };
+      craneLib = crane.mkLib pkgs;
+      rust = craneLib.buildPackage {src = craneLib.cleanCargoSource ./.;};
+      image = pkgs.dockerTools.streamLayeredImage {
+        name = "claudepod";
+        tag = "latest";
+        contents = [];
+        includeStorePaths = false;
+        config.Entrypoint = [
+          "${import ./entrypoint.nix {
+            inherit pkgs;
+            toplevel = guest.config.system.build.toplevel;
+          }}"
+        ];
+      };
+    in
+      pkgs.runCommand "claudepod" {
+        nativeBuildInputs = [pkgs.makeWrapper];
+        passthru = {inherit rust image;};
+      } ''
+        mkdir -p $out/bin
+        makeWrapper ${rust}/bin/claudepod-start $out/bin/claudepod \
+          --inherit-argv0 \
+          --set CLAUDEPOD_USERNAME ${pkgs.lib.escapeShellArg username} \
+          --set CLAUDEPOD_IMAGE ${image} \
+          --set CLAUDEPOD_PODMAN ${pkgs.podman}/bin/podman
+        ln -s claudepod $out/bin/gptpod
+      '';
 
-      mkGuest = {
-        system ? "x86_64-linux",
-        username,
-        extraGuestPackages ? (_: []),
-        modules ? [],
-        specialArgs ? {},
-      }:
-        nixpkgs.lib.nixosSystem {
-          inherit system specialArgs;
-          modules =
-            [
-              guestModule
-              {
-                claudepod = {
-                  inherit username extraGuestPackages;
-                };
-              }
-            ]
-            ++ modules;
-        };
-
-      mkPackage = {
-        pkgs,
-        username,
-        guestSystem ? pkgs.stdenv.hostPlatform.system,
-        extraGuestPackages ? (_: []),
-        guestModules ? [],
-      }: let
-        craneLib = mkCraneLib pkgs;
-        guest = mkGuest {
-          system = guestSystem;
-          inherit username extraGuestPackages;
-          modules = guestModules;
-        };
-        image = mkImage {
-          inherit pkgs;
-          toplevel = guest.config.system.build.toplevel;
-        };
-      in
-        import ./package.nix {
-          inherit pkgs craneLib username image;
-        };
-
-      mkRustPackage = {pkgs}: let
-        craneLib = mkCraneLib pkgs;
-      in
-        craneLib.buildPackage {
-          src = craneLib.cleanCargoSource ./.;
-        };
+    claudepod = mkClaudepod {
+      inherit pkgs;
+      username = defaultUsername;
     };
-  in
-    {
-      lib = claudepodLib;
-      nixosModules.default = guestModule;
-      homeModules.default = import ./home-manager-module.nix {inherit self;};
-    }
-    // {
-      packages.x86_64-linux = let
-        claudepod = claudepodLib.mkPackage {
-          inherit pkgs;
-          username = defaultUsername;
-        };
-        claudepodRust = claudepodLib.mkRustPackage {inherit pkgs;};
-      in {
-        default = claudepod;
-        claudepod = claudepod;
-        claudepod-rust = claudepodRust;
-      };
+  in {
+    nixosModules.default = guestModule;
+    homeModules.default = import ./home-manager-module.nix {inherit mkClaudepod;};
 
-      apps.x86_64-linux = let
-        claudepodPackage = self.packages.x86_64-linux.claudepod;
-      in rec {
-        default = claudepod;
-        claudepod = {
-          type = "app";
-          program = "${claudepodPackage}/bin/claudepod";
-        };
-        gptpod = {
-          type = "app";
-          program = "${claudepodPackage}/bin/gptpod";
-        };
-      };
-
-      checks.x86_64-linux = {
-        claudepod-rust = self.packages.x86_64-linux.claudepod-rust;
-      };
-
-      devShells.x86_64-linux.default = let
-        devGuest = claudepodLib.mkGuest {
-          system = pkgs.stdenv.hostPlatform.system;
-          username = defaultUsername;
-        };
-        devImage = claudepodLib.mkImage {
-          inherit pkgs;
-          toplevel = devGuest.config.system.build.toplevel;
-        };
-      in
-        pkgs.mkShell {
-          CLAUDEPOD_USERNAME = defaultUsername;
-          CLAUDEPOD_IMAGE = "${devImage}";
-          CLAUDEPOD_PODMAN = "${pkgs.podman}/bin/podman";
-
-          packages = [
-            pkgs.cargo
-            pkgs.clippy
-            pkgs.rust-analyzer
-            pkgs.rustc
-            pkgs.rustfmt
-          ];
-        };
+    packages.x86_64-linux = {
+      default = claudepod;
+      inherit claudepod;
     };
+
+    apps.x86_64-linux = {
+      default = self.apps.x86_64-linux.claudepod;
+      claudepod = {
+        type = "app";
+        program = "${claudepod}/bin/claudepod";
+      };
+      gptpod = {
+        type = "app";
+        program = "${claudepod}/bin/gptpod";
+      };
+    };
+
+    checks.x86_64-linux = {
+      claudepod-rust = claudepod.rust;
+    };
+
+    devShells.x86_64-linux.default = pkgs.mkShell {
+      CLAUDEPOD_USERNAME = defaultUsername;
+      CLAUDEPOD_IMAGE = "${claudepod.image}";
+      CLAUDEPOD_PODMAN = "${pkgs.podman}/bin/podman";
+
+      packages = [
+        pkgs.cargo
+        pkgs.clippy
+        pkgs.rust-analyzer
+        pkgs.rustc
+        pkgs.rustfmt
+      ];
+    };
+  };
 }
