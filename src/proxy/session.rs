@@ -1,0 +1,221 @@
+//! Per-connection relay state machine: handshakes, post-handshake exchange,
+//! then the op loop.
+
+use anyhow::{Context, Result, bail};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
+
+use super::{handshake, ops, stderr, wire};
+
+/// Drive one guest connection against one host daemon connection until the
+/// guest hangs up or a protocol violation kills the session.
+pub async fn run<GR, GW, HR, HW>(guest_r: GR, guest_w: GW, host_r: HR, host_w: HW) -> Result<()>
+where
+    GR: AsyncRead + Unpin,
+    GW: AsyncWrite + Unpin,
+    HR: AsyncRead + Unpin,
+    HW: AsyncWrite + Unpin,
+{
+    let mut gr = BufReader::new(guest_r);
+    let mut gw = BufWriter::new(guest_w);
+    let mut hr = BufReader::new(host_r);
+    let mut hw = BufWriter::new(host_w);
+
+    let negotiated = handshake::upstream(&mut hr, &mut hw)
+        .await
+        .context("host daemon handshake")?;
+    handshake::downstream(&mut gr, &mut gw, &negotiated)
+        .await
+        .context("guest handshake")?;
+
+    // Client post-handshake fields: obsolete CPU affinity (a nonzero word is
+    // followed by the affinity value), obsolete reserveSpace.
+    if wire::copy_u64(&mut gr, &mut hw).await? != 0 {
+        wire::copy_u64(&mut gr, &mut hw).await?;
+    }
+    wire::copy_u64(&mut gr, &mut hw).await?;
+    hw.flush().await?;
+
+    // Daemon handshake info (nix version string, trusted flag), then the
+    // greeting stderr exchange.
+    wire::copy_string(&mut hr, &mut gw).await?;
+    wire::copy_u64(&mut hr, &mut gw).await?;
+    stderr::relay(&mut hr, &mut gw).await.context("greeting")?;
+    gw.flush().await?;
+
+    loop {
+        let Some(word) = wire::read_u64_or_eof(&mut gr).await? else {
+            return Ok(()); // guest hung up between ops
+        };
+        let Some(op) = ops::Op::allowed(word) else {
+            // A loud failure: the guest's lower store should never reach for
+            // anything outside the allowlist (see docs/nix-proxy.md).
+            let msg = format!(
+                "rejected op {} ({word}): not in the read-only allowlist",
+                ops::op_name(word)
+            );
+            stderr::write_error(&mut gw, &msg).await?;
+            bail!(msg);
+        };
+
+        wire::write_u64(&mut hw, word).await?;
+        if let Err(err) = ops::copy_args(op, &negotiated, &mut gr, &mut hw).await {
+            let err = err.context(format!("{} arguments", op.name()));
+            let _ = stderr::write_error(&mut gw, &format!("{err:#}")).await;
+            return Err(err);
+        }
+        hw.flush().await?;
+
+        // No synthetic error on failure: relay() may have left the guest
+        // mid-message (it synthesizes one itself at the points where the
+        // guest is known to be message-aligned).
+        let terminal = stderr::relay(&mut hr, &mut gw)
+            .await
+            .with_context(|| format!("{} stderr", op.name()))?;
+        if terminal == stderr::Terminal::Last {
+            // No synthetic error on failure here: the guest may have
+            // consumed a partial result, so the stream is unsalvageable.
+            // Closing makes it error out instead.
+            ops::copy_result(op, &negotiated, &mut hr, &mut gw)
+                .await
+                .with_context(|| format!("{} result", op.name()))?;
+        }
+        gw.flush().await?;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::proxy::handshake::{WORKER_MAGIC_1, WORKER_MAGIC_2};
+    use crate::proxy::testutil::{put_str, put_u64};
+
+    const VERSION_1_38: u64 = 0x126;
+
+    /// Everything the guest sends, through one IsValidPath op.
+    fn guest_script() -> Vec<u8> {
+        let mut buf = Vec::new();
+        put_u64(&mut buf, WORKER_MAGIC_1);
+        put_u64(&mut buf, VERSION_1_38);
+        put_u64(&mut buf, 1); // client features
+        put_str(&mut buf, b"disable-set-options");
+        put_u64(&mut buf, 0); // obsolete CPU affinity
+        put_u64(&mut buf, 0); // obsolete reserveSpace
+        buf
+    }
+
+    /// Everything the host daemon sends, through the greeting.
+    fn host_script() -> Vec<u8> {
+        let mut buf = Vec::new();
+        put_u64(&mut buf, WORKER_MAGIC_2);
+        put_u64(&mut buf, VERSION_1_38);
+        put_u64(&mut buf, 0); // daemon features
+        put_str(&mut buf, b"2.34.7"); // daemon nix version
+        put_u64(&mut buf, 2); // trusted: NotTrusted
+        put_u64(&mut buf, stderr::STDERR_LAST);
+        buf
+    }
+
+    async fn run_session(guest_in: &[u8], host_in: &[u8]) -> (Result<()>, Vec<u8>, Vec<u8>) {
+        let mut guest_out = Vec::new();
+        let mut host_out = Vec::new();
+        let result = run(
+            &mut &guest_in[..],
+            &mut guest_out,
+            &mut &host_in[..],
+            &mut host_out,
+        )
+        .await;
+        (result, guest_out, host_out)
+    }
+
+    #[tokio::test]
+    async fn full_session_is_valid_path() {
+        let mut guest_in = guest_script();
+        put_u64(&mut guest_in, 1); // IsValidPath
+        put_str(&mut guest_in, b"/nix/store/abc-foo");
+        // Guest EOF after the op: clean shutdown.
+
+        let mut host_in = host_script();
+        put_u64(&mut host_in, stderr::STDERR_LAST);
+        put_u64(&mut host_in, 1); // result: valid
+
+        let (result, guest_out, host_out) = run_session(&guest_in, &host_in).await;
+        result.unwrap();
+
+        // Toward the host: our handshake, relayed post-handshake fields,
+        // relayed op.
+        let mut expected_host = Vec::new();
+        put_u64(&mut expected_host, WORKER_MAGIC_1);
+        put_u64(&mut expected_host, VERSION_1_38);
+        put_u64(&mut expected_host, 0); // our (empty) feature list
+        put_u64(&mut expected_host, 0);
+        put_u64(&mut expected_host, 0);
+        put_u64(&mut expected_host, 1);
+        put_str(&mut expected_host, b"/nix/store/abc-foo");
+        assert_eq!(host_out, expected_host);
+
+        // Toward the guest: our handshake, relayed greeting, relayed result.
+        let mut expected_guest = Vec::new();
+        put_u64(&mut expected_guest, WORKER_MAGIC_2);
+        put_u64(&mut expected_guest, VERSION_1_38);
+        put_u64(&mut expected_guest, 0); // negotiated (empty) feature list
+        put_str(&mut expected_guest, b"2.34.7");
+        put_u64(&mut expected_guest, 2);
+        put_u64(&mut expected_guest, stderr::STDERR_LAST);
+        put_u64(&mut expected_guest, stderr::STDERR_LAST);
+        put_u64(&mut expected_guest, 1);
+        assert_eq!(guest_out, expected_guest);
+    }
+
+    #[tokio::test]
+    async fn rejects_disallowed_op() {
+        let mut guest_in = guest_script();
+        put_u64(&mut guest_in, 7); // AddToStore
+
+        let (result, guest_out, host_out) = run_session(&guest_in, &host_script()).await;
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("rejected op AddToStore (7)"),
+            "{err}"
+        );
+
+        // Nothing op-related reaches the host (only handshake + post-handshake).
+        // magic, version, empty feature list, 2 obsolete fields
+        let handshake_len = 8 * 5;
+        assert_eq!(host_out.len(), handshake_len);
+
+        // The guest gets a parseable synthetic error after the greeting.
+        let text = String::from_utf8_lossy(&guest_out).into_owned();
+        assert!(
+            text.contains("claudepod-nix-proxy: rejected op AddToStore"),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn daemon_error_is_relayed_and_session_continues() {
+        let mut guest_in = guest_script();
+        put_u64(&mut guest_in, 26); // QueryPathInfo
+        put_str(&mut guest_in, b"/nix/store/abc-foo");
+        put_u64(&mut guest_in, 1); // IsValidPath, to prove the loop survives
+        put_str(&mut guest_in, b"/nix/store/abc-foo");
+
+        let mut host_in = host_script();
+        // QueryPathInfo fails with a daemon-side error...
+        put_u64(&mut host_in, stderr::STDERR_ERROR);
+        put_str(&mut host_in, b"Error");
+        put_u64(&mut host_in, 0);
+        put_str(&mut host_in, b"Error");
+        put_str(&mut host_in, b"path '/nix/store/abc-foo' is not valid");
+        put_u64(&mut host_in, 0);
+        put_u64(&mut host_in, 0);
+        // ...then IsValidPath succeeds.
+        put_u64(&mut host_in, stderr::STDERR_LAST);
+        put_u64(&mut host_in, 0);
+
+        let (result, guest_out, _) = run_session(&guest_in, &host_in).await;
+        result.unwrap();
+        let text = String::from_utf8_lossy(&guest_out).into_owned();
+        assert!(text.contains("is not valid"), "{text}");
+    }
+}

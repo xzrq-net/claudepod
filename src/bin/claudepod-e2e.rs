@@ -31,7 +31,15 @@ async fn main() -> Result<()> {
 async fn reexec_under_unshare() -> Result<()> {
     let exe = std::env::current_exe()?;
     let status = Command::new("unshare")
-        .args(["--user", "--map-root-user", "--mount", "--pid", "--fork", "--mount-proc", "--"])
+        .args([
+            "--user",
+            "--map-root-user",
+            "--mount",
+            "--pid",
+            "--fork",
+            "--mount-proc",
+            "--",
+        ])
         .arg(exe)
         .env(REEXEC_GUARD, "1")
         .status()
@@ -89,7 +97,9 @@ impl Fixture {
         let env = Env::setup().context("filesystem setup")?;
 
         step("start host nix-daemon");
-        let host_daemon = env.spawn_daemon(&env.host_state, &env.host_socket, None).await?;
+        let host_daemon = env
+            .spawn_daemon(&env.host_state, &env.host_socket, None)
+            .await?;
 
         step("seed host store");
         let seed = env.home.join("seed");
@@ -172,8 +182,14 @@ impl Env {
         };
 
         std::fs::create_dir_all(&root)?;
-        mount(Some("tmpfs"), &root, Some("tmpfs"), MsFlags::empty(), None::<&str>)
-            .context("mount tmpfs")?;
+        mount(
+            Some("tmpfs"),
+            &root,
+            Some("tmpfs"),
+            MsFlags::empty(),
+            None::<&str>,
+        )
+        .context("mount tmpfs")?;
 
         let guest_work = root.join("guest/work");
         // The merged overlay must sit at root + logical store dir, where the
@@ -205,8 +221,14 @@ impl Env {
              trusted-users =\n",
         )?;
 
-        mount(Some(&env.store), &env.guest_lower, None::<&str>, MsFlags::MS_BIND, None::<&str>)
-            .context("bind mount lower store")?;
+        mount(
+            Some(&env.store),
+            &env.guest_lower,
+            None::<&str>,
+            MsFlags::MS_BIND,
+            None::<&str>,
+        )
+        .context("bind mount lower store")?;
         mount(
             None::<&str>,
             &env.guest_lower,
