@@ -116,9 +116,11 @@ in a rootless setup.
 
 ## Testing
 
-Integration test as a separate binary (cargo integration test) that re-execs
-itself under new user+mount namespaces (unshare), so it runs unprivileged and
-can mount:
+End-to-end test as a regular binary (`cargo run --bin claudepod-e2e`, not the cargo
+test harness — legible sequential setup, no test concurrency) that re-execs
+itself under new user+mount+pid namespaces via util-linux `unshare
+--map-root-user` ("am I pid 1?" is the in-namespace marker), so it runs
+unprivileged, can mount, and the pid namespace reaps the daemons on exit:
 
 1. Set up two stores on tmpfs: a "host" store and an overlayfs-merged
    "container" store (upper on tmpfs, lower = host store), mirroring the real
