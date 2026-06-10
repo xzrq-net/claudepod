@@ -39,5 +39,10 @@ in
       printf '%s=%q\n' MAX_THINKING_TOKENS "$MAX_THINKING_TOKENS" >> /run/claudepod-env
     fi
 
+    if [ -n "''${CLAUDEPOD_VERBOSE-}" ]; then
+      ${mkdir} -p /run/systemd/system.conf.d
+      printf '[Manager]\nShowStatus=yes\n' > /run/systemd/system.conf.d/50-claudepod-verbose.conf
+    fi
+
     exec ${toplevel}/init
   ''

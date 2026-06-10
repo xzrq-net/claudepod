@@ -13,6 +13,10 @@ struct Args {
     #[arg(short = 's')]
     shell: bool,
 
+    /// Verbose mode: show systemd boot messages in the guest.
+    #[arg(short = 'V')]
+    verbose: bool,
+
     /// Mount path, or host:guest volume spec, into the guest.
     #[arg(short = 'v', value_name = "SPEC")]
     extra_volumes: Vec<OsString>,
@@ -112,6 +116,9 @@ fn main() -> Result<()> {
     }
     for name in env_names {
         command.arg("-e").arg(name);
+    }
+    if args.verbose {
+        command.arg("-e").arg("CLAUDEPOD_VERBOSE=1");
     }
     command
         .arg("-e")

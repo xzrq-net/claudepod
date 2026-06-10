@@ -26,6 +26,8 @@
 
     guestModule = import ./guest-module.nix {inherit nix-index-database;};
 
+    defaultUsername = "user";
+
     claudepodLib = rec {
       mkImage = {
         pkgs,
@@ -43,7 +45,7 @@
 
       mkGuest = {
         system ? "x86_64-linux",
-        username ? "user",
+        username,
         extraGuestPackages ? (_: []),
         modules ? [],
         specialArgs ? {},
@@ -64,7 +66,7 @@
 
       mkPackage = {
         pkgs,
-        username ? "user",
+        username,
         guestSystem ? pkgs.stdenv.hostPlatform.system,
         extraGuestPackages ? (_: []),
         guestModules ? [],
@@ -99,7 +101,10 @@
     }
     // {
       packages.x86_64-linux = let
-        claudepod = claudepodLib.mkPackage {inherit pkgs;};
+        claudepod = claudepodLib.mkPackage {
+          inherit pkgs;
+          username = defaultUsername;
+        };
         claudepodRust = claudepodLib.mkRustPackage {inherit pkgs;};
       in {
         default = claudepod;
@@ -126,10 +131,9 @@
       };
 
       devShells.x86_64-linux.default = let
-        devUsername = "user";
         devGuest = claudepodLib.mkGuest {
           system = pkgs.stdenv.hostPlatform.system;
-          username = devUsername;
+          username = defaultUsername;
         };
         devImage = claudepodLib.mkImage {
           inherit pkgs;
@@ -137,7 +141,7 @@
         };
       in
         pkgs.mkShell {
-          CLAUDEPOD_USERNAME = devUsername;
+          CLAUDEPOD_USERNAME = defaultUsername;
           CLAUDEPOD_IMAGE = "${devImage}";
           CLAUDEPOD_PODMAN = "${pkgs.podman}/bin/podman";
 

@@ -50,7 +50,6 @@ in {
   options.claudepod = {
     username = lib.mkOption {
       type = lib.types.str;
-      default = "user";
       description = "Normal user created inside the claudepod guest.";
     };
 
