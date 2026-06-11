@@ -159,9 +159,16 @@ in {
       nameserver 8.8.4.4
     '';
 
-    nix.settings.experimental-features = ["nix-command" "flakes" "local-overlay-store" "read-only-local-store"];
+    nix.settings.experimental-features = ["nix-command" "flakes" "local-overlay-store"];
+
+    # Only root (the guest nix-daemon) may reach the proxy socket; podman
+    # creates the mountpoint parent 0755, which would let any guest uid
+    # connect. The socket itself must stay 0666 for host-side uid-mapping
+    # reasons (see spawn_nix_proxy in claudepod-start.rs).
+    systemd.tmpfiles.rules = ["z /nix/.host-nix-daemon 0700 root root - -"];
 
     # check-mount=false: nix overlay store check-mount validation doesn't match kernel overlayfs /proc/mounts format
-    systemd.services.nix-daemon.environment.NIX_REMOTE = "local-overlay://?lower-store=local%%3A%%2F%%2F%%3Froot%%3D%%2Fnix%%2F.host-nix%%26read-only%%3Dtrue&upper-layer=/nix/.rw-store/store&real=/nix/store&check-mount=false";
+    # lower-store: host-side nix proxy socket, bind-mounted in by claudepod-start (see docs/nix-proxy.md)
+    systemd.services.nix-daemon.environment.NIX_REMOTE = "local-overlay://?lower-store=unix%%3A%%2F%%2F%%2Fnix%%2F.host-nix-daemon%%2Fsocket&upper-layer=/nix/.rw-store/store&real=/nix/store&check-mount=false";
   };
 }

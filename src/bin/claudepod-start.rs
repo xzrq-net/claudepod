@@ -1,10 +1,16 @@
 use std::ffi::OsString;
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::os::unix::net::UnixListener;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
+use nix::fcntl::{FcntlArg, FdFlag, fcntl};
+
+const HOST_DAEMON_SOCKET: &str = "/nix/var/nix/daemon-socket/socket";
 
 #[derive(Debug, Parser)]
 #[command(disable_version_flag = true, trailing_var_arg = true)]
@@ -51,9 +57,14 @@ fn main() -> Result<()> {
 
     load_image(&image, &podman)?;
 
+    let proxy_socket = spawn_nix_proxy()?;
+
     let mut volumes = vec![
         OsString::from("/nix/store:/nix/store:ro"),
-        OsString::from("/nix/var/nix/db:/nix/.host-nix/nix/var/nix/db:ro"),
+        OsString::from(format!(
+            "{}:/nix/.host-nix-daemon/socket",
+            proxy_socket.display()
+        )),
         OsString::from(format!("{}:/home/{username}", home_dir.display())),
         OsString::from(format!("{}:/home/{username}/src", src_root.display())),
     ];
@@ -124,12 +135,85 @@ fn main() -> Result<()> {
         .arg(format!("CLAUDEPOD_PROJECT_PATH={guest_path}"))
         .arg("-e")
         .arg(format!("CLAUDEPOD_MODE={mode}"))
-        .arg("-e")
-        .arg(format!("CLAUDEPOD_HAS_PROJECT={need_project_share}"))
         .arg("claudepod:latest")
         .args(args.command);
 
     Err(command.exec()).context("failed to exec podman")
+}
+
+/// Start the nix proxy (see docs/nix-proxy.md) and return the host path of
+/// its listening socket, ready to bind-mount into the container.
+///
+/// The listener is bound here and passed across the exec boundary as an
+/// inherited fd, so it is accepting before podman starts — no readiness
+/// race. The proxy outlives this process's exec into podman and exits via
+/// PR_SET_PDEATHSIG when the podman process dies; it unlinks the socket on
+/// the first accepted connection (podman's bind mount pins the inode), so
+/// the happy path leaves no host filesystem residue even if the proxy is
+/// later SIGKILLed.
+fn spawn_nix_proxy() -> Result<PathBuf> {
+    if !Path::new(HOST_DAEMON_SOCKET).exists() {
+        bail!("host nix daemon socket {HOST_DAEMON_SOCKET} not found; is nix-daemon running?");
+    }
+
+    let socket_path = proxy_socket_path()?;
+    // Pid reuse could collide with a socket leaked by a SIGKILLed proxy.
+    match std::fs::remove_file(&socket_path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("failed to remove stale {}", socket_path.display()));
+        }
+    }
+    let listener = UnixListener::bind(&socket_path)
+        .with_context(|| format!("failed to listen on {}", socket_path.display()))?;
+    // The guest nix-daemon connects as container root, which keep-id maps
+    // to a host subuid — not the socket's owner — and connect() needs write
+    // permission on the inode. The 0700 runtime dir still gates host-side
+    // access.
+    std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o666))
+        .with_context(|| format!("failed to chmod {}", socket_path.display()))?;
+
+    // Strip CLOEXEC so the proxy child inherits the listener at the same fd
+    // number. Single-threaded, and the listener drops right after spawn, so
+    // the cleared flag never leaks into the later exec of podman.
+    fcntl(&listener, FcntlArg::F_SETFD(FdFlag::empty()))
+        .context("failed to clear CLOEXEC on proxy listener")?;
+
+    let proxy_bin = std::env::current_exe()
+        .context("failed to resolve own executable path")?
+        .with_file_name("claudepod-nix-proxy");
+    Command::new(&proxy_bin)
+        .arg("--listen-fd")
+        .arg(listener.as_raw_fd().to_string())
+        .arg("--parent-pid")
+        .arg(std::process::id().to_string())
+        .stdin(Stdio::null())
+        .spawn()
+        .with_context(|| format!("failed to spawn {}", proxy_bin.display()))?;
+
+    Ok(socket_path)
+}
+
+/// Per-instance socket path; the pid is unique for the session's lifetime
+/// since this process becomes podman via exec. Prefer XDG_RUNTIME_DIR
+/// (tmpfs, wiped at logout) so even a SIGKILLed proxy leaves nothing
+/// durable.
+fn proxy_socket_path() -> Result<PathBuf> {
+    let name = format!("nix-proxy-{}.sock", std::process::id());
+    let dirs = xdg::BaseDirectories::with_prefix("claudepod");
+    if let Ok(path) = dirs.place_runtime_file(&name) {
+        return Ok(path);
+    }
+    let run_dir = state_dir()?.join("run");
+    // 0700 like XDG_RUNTIME_DIR: the socket inside is world-writable.
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&run_dir)
+        .with_context(|| format!("failed to create {}", run_dir.display()))?;
+    Ok(run_dir.join(name))
 }
 
 fn command_name() -> String {

@@ -108,35 +108,57 @@ binary can drive it in-process:
   are rejected).
 - `session` — per-connection state machine: dial upstream, handshakes, op
   loop dispatching through policy.
-- `main` — clap (`--listen <socket>`, `--upstream`, default
-  `/nix/var/nix/daemon-socket/socket`), accept loop, one tokio task per
+- `main` — internal helper spawned by claudepod-start: `--listen-fd`,
+  `--parent-pid`, `--upstream` defaulting to
+  `/nix/var/nix/daemon-socket/socket`. Accept loop, one tokio task per
   connection. The guest daemon uses a connection pool, so concurrent
-  connections are normal; each maps 1:1 to an upstream connection.
+  connections are normal; each maps 1:1 to an upstream connection. The
+  socket path to unlink is recovered from the listener fd itself.
 
 New deps: `tokio`. Built like the other binaries via crane in flake.nix.
 
 ## Lifecycle and invocation
 
-- `claudepod-start` currently `exec`s podman (`claudepod-start.rs:126`).
-  It changes to spawn-and-wait: create a per-instance runtime dir (XDG
-  runtime dir), start the proxy listening there, run podman as a child, wait,
-  then kill the proxy and remove the socket. Proxy lifetime == container
-  lifetime; one proxy per pod instance, so concurrent pods don't share state.
+`claudepod-start` keeps its tail `exec` into podman — that's the only sane
+way to hand over interactive process state — and the proxy rides on two
+facts: exec preserves the pid, and fds without CLOEXEC survive both spawn
+and exec.
+
+- `claudepod-start` binds the listener itself (one socket file under
+  `$XDG_RUNTIME_DIR/claudepod/nix-proxy-<pid>.sock`, no runtime dir to
+  manage), strips CLOEXEC, spawns `claudepod-nix-proxy --listen-fd` with the
+  inherited fd, drops its own copy, then execs podman. Binding before spawn
+  means the socket accepts before podman starts — no readiness race.
+- Lifetime: the proxy sets `PR_SET_PDEATHSIG(SIGTERM)` keyed to the
+  claudepod-start pid — which *is* the podman pid after the exec. When the
+  podman process dies, however it dies, the kernel reaps the proxy. No
+  cooperation from podman required (it carries no fds, no pipes). The proxy
+  double-checks `getppid()` against `--parent-pid` after the prctl, and
+  installs its signal handlers before it, so a parent death at any point
+  lands on the cleanup path.
+- Cleanup: the proxy unlinks the host-side socket on the *first accepted
+  connection*. Podman's bind mount pins the socket inode, and connections
+  can only arrive through that mount, so the first accept proves the
+  host-side name is dead weight; the container keeps connecting through the
+  pinned inode for the whole session. Happy path leaves zero host
+  filesystem residue even if the proxy is later SIGKILLed. If no connection
+  ever arrives, the SIGTERM/SIGINT handler unlinks instead; the
+  tmpfs-backed runtime dir is the backstop for SIGKILL-before-first-accept.
 - Proxy crash mid-session: guest daemon gets connection errors on lower-store
   queries and surfaces them to the nix client; nothing corrupts. No automatic
   restart in v1.
 
-## Container protocol (TBD)
+## Container protocol
 
-Probable shape: bind-mount the runtime dir (or just the socket) into the
-container as a podman volume, e.g. `…/nix-proxy.sock:/nix/.host-nix-daemon/socket`,
-and set the guest daemon's lower store to
-`unix:///nix/.host-nix-daemon/socket` in `guest-module.nix` (NIX_REMOTE,
-currently line 166). Open detail: whether the `unix://` store needs explicit
-`root`/`real` params so its `realStoreDir` matches the overlay's expectations
-(`check-mount=false` today makes this moot, but verify against `toUpperPath`
-and friends). Socket permissions are simple — both ends run as the same user
-in a rootless setup.
+The socket *file* (not its directory — unlinking inside a mounted directory
+would remove it from the container's view too) is bind-mounted as a podman
+volume at `/nix/.host-nix-daemon/socket`, and the guest daemon's lower store
+is `unix:///nix/.host-nix-daemon/socket` (`guest-module.nix` NIX_REMOTE).
+The `unix://` store needs no `root`/`real` params: the merged overlay sits
+at the logical store dir, so the remote store's default `realStoreDir`
+(`/nix/store`) is already correct — the e2e fixture pins this layout.
+Socket permissions are simple — both ends run as the same user in a
+rootless setup.
 
 ## Testing
 
@@ -190,8 +212,3 @@ via builds and the demand sweep.
 Unit tests for `wire`/`handshake`/`ops` against byte fixtures; optionally a
 recorded real session (via nix-wire's `record`) replayed against the parser.
 
-## Cleanup once landed
-
-- Drop `/nix/var/nix/db` mount from `claudepod-start.rs`.
-- Drop the WAL checkpoint sudo hack and its README caveat (README:114-122).
-- Update README store-architecture section for the new lower store.

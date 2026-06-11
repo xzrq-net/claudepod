@@ -24,7 +24,16 @@ const MAX_SESSIONS: usize = 32;
 
 /// Accept loop. One relay session per connection; the guest daemon uses a
 /// connection pool, so concurrent sessions are normal.
-pub async fn serve(listener: UnixListener, upstream: PathBuf) -> Result<()> {
+///
+/// `on_first_accept` runs after the first successful accept. claudepod-start
+/// uses it to unlink the listening socket: podman's bind mount into the
+/// container pins the inode, and a connection proves the mount is up, so the
+/// host-side name is no longer needed.
+pub async fn serve(
+    listener: UnixListener,
+    upstream: PathBuf,
+    mut on_first_accept: Option<Box<dyn FnOnce() + Send>>,
+) -> Result<()> {
     let limiter = Arc::new(Semaphore::new(MAX_SESSIONS));
     loop {
         // Backpressure before accept: at capacity, new connections wait in
@@ -44,6 +53,9 @@ pub async fn serve(listener: UnixListener, upstream: PathBuf) -> Result<()> {
                 continue;
             }
         };
+        if let Some(hook) = on_first_accept.take() {
+            hook();
+        }
         let upstream = upstream.clone();
         tokio::spawn(async move {
             let _permit = permit;

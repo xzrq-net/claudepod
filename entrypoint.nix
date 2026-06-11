@@ -11,19 +11,18 @@ in
     # Set up nix store overlay, then hand off to NixOS init.
 
     # Preserve host nix store reference before overlaying
-    ${mkdir} -p /nix/.host-nix/nix/store
-    ${mount} --bind /nix/store /nix/.host-nix/nix/store
+    ${mkdir} -p /nix/.host-store
+    ${mount} --bind /nix/store /nix/.host-store
 
     # Writable overlay for /nix/store backed by tmpfs
     ${mkdir} -p /nix/.rw-store
     ${mount} -t tmpfs -o mode=755 none /nix/.rw-store
     ${mkdir} -p /nix/.rw-store/store /nix/.rw-store/work
-    ${mount} -t overlay overlay -o lowerdir=/nix/.host-nix/nix/store,upperdir=/nix/.rw-store/store,workdir=/nix/.rw-store/work,userxattr /nix/store
+    ${mount} -t overlay overlay -o lowerdir=/nix/.host-store,upperdir=/nix/.rw-store/store,workdir=/nix/.rw-store/work,userxattr /nix/store
 
     # Write runtime config for guest systemd service
     echo "''${CLAUDEPOD_PROJECT_PATH:-/tmp}" > /run/claudepod-project
     echo "''${CLAUDEPOD_MODE:-shell}" > /run/claudepod-mode
-    echo "''${CLAUDEPOD_HAS_PROJECT:-false}" > /run/claudepod-has-project
     : > /run/claudepod-command
     if [ "$#" -gt 0 ]; then
       printf '%s\0' "$@" > /run/claudepod-command

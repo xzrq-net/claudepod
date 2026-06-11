@@ -142,7 +142,7 @@ impl Fixture {
         let listener = UnixListener::bind(&env.proxy_socket)?;
         let upstream = env.host_socket.clone();
         tokio::spawn(async move {
-            if let Err(err) = claudepod::proxy::serve(listener, upstream).await {
+            if let Err(err) = claudepod::proxy::serve(listener, upstream, None).await {
                 eprintln!("proxy died: {err:#}");
             }
         });
@@ -513,7 +513,7 @@ impl Env {
         // the host daemon as a plain user.
         std::fs::write(
             env.conf.join("nix.conf"),
-            "experimental-features = nix-command local-overlay-store read-only-local-store\n\
+            "experimental-features = nix-command local-overlay-store\n\
              sandbox = false\n\
              build-users-group =\n\
              require-drop-supplementary-groups = false\n\

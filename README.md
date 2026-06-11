@@ -15,8 +15,8 @@ ambient credentials like dotfiles. Isolation model:
 - host Nix store is fully readable (you don't keep secrets in there, do you?)
 
 The container itself is a few hundred kilobytes. It mounts the host Nix store
-read-only and uses the Nix daemon's local-overlay feature to consult the host
-database. See caveat below.
+read-only and uses the Nix daemon's local-overlay feature, consulting the host
+daemon for metadata through a read-only proxy.
 
 ## Quick Start
 
@@ -96,28 +96,20 @@ Example:
 The guest Nix daemon is configured with:
 
 ```text
-NIX_REMOTE=local-overlay://?lower-store=local%3A%2F%2F%3Froot%3D%2Fnix%2F.host-nix%26read-only%3Dtrue&upper-layer=/nix/.rw-store/store&real=/nix/store&check-mount=false
+NIX_REMOTE=local-overlay://?lower-store=unix%3A%2F%2F%2Fnix%2F.host-nix-daemon%2Fsocket&upper-layer=/nix/.rw-store/store&real=/nix/store&check-mount=false
 ```
 
 Broken down:
 
 - `local-overlay://`: use Nix's local overlay store implementation.
-- `lower-store=local://?root=/nix/.host-nix&read-only=true`: The container
-  mounts the host Nix store and database read-only. Use them as the lower layer.
-  - `read-only=true`: do not try to write to the host store or database.
+- `lower-store=unix:///nix/.host-nix-daemon/socket`: lower-layer metadata
+  queries go to a host-side proxy (`claudepod-nix-proxy`) over a bind-mounted
+  socket. The proxy forwards a small set of read-only operations to the
+  host nix-daemon and rejects everything else; store *contents* still come
+  from the read-only `/nix/store` mount.
 - `upper-layer=/nix/.rw-store/store`: put guest-created store paths in the
   writable overlay upper layer. This is backed by tmpfs inside the container.
 - `real=/nix/store`: expose the combined lower and upper store at the normal
   `/nix/store` path used by guest processes.
 - `check-mount=false`: skip Nix's overlay-store mount validation because it does
   not match the kernel overlayfs format reported in `/proc/mounts`.
-
-### Caveat
-
-`read-only` means the guest Nix daemon only reads the main database file, not
-the SQLite WAL log. Recent host database changes may fail to show up with
-obscure `fchmodat` errors. To sync things up, run this command on the host:
-
-```shell
-sudo sqlite3 /nix/var/nix/db/db.sqlite 'PRAGMA wal_checkpoint(FULL);'
-```

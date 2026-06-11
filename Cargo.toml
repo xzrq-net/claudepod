@@ -6,6 +6,6 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.102"
 clap = { version = "4.6.1", features = ["derive"] }
-nix = { version = "0.31.3", features = ["mount"] }
+nix = { version = "0.31.3", features = ["fs", "mount", "process"] }
 tokio = { version = "1.52.3", features = ["full"] }
 xdg = "3.0.0"
