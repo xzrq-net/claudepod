@@ -27,6 +27,13 @@ const MAX_SESSIONS: usize = 32;
 pub async fn serve(listener: UnixListener, upstream: PathBuf) -> Result<()> {
     let limiter = Arc::new(Semaphore::new(MAX_SESSIONS));
     loop {
+        // Backpressure before accept: at capacity, new connections wait in
+        // the kernel backlog where they cost this process no fds; once the
+        // backlog fills, connect() blocks or fails guest-side. Accepting
+        // first and queueing on the permit would let a connect flood
+        // exhaust the proxy's fd limit. (Never closed, so acquire can't
+        // fail.)
+        let permit = limiter.clone().acquire_owned().await.unwrap();
         // Accept errors (e.g. transient EMFILE) must not take down the
         // sessions already running.
         let guest = match listener.accept().await {
@@ -38,10 +45,8 @@ pub async fn serve(listener: UnixListener, upstream: PathBuf) -> Result<()> {
             }
         };
         let upstream = upstream.clone();
-        let limiter = limiter.clone();
         tokio::spawn(async move {
-            // Never closed, so acquire cannot fail.
-            let _permit = limiter.acquire_owned().await.unwrap();
+            let _permit = permit;
             if let Err(err) = relay(guest, &upstream).await {
                 eprintln!("claudepod-nix-proxy: session failed: {err:#}");
             }

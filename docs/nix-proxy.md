@@ -44,8 +44,10 @@ bounds are derived from the protocol where possible, generous everywhere —
 they exist to stop abuse, not to police a healthy client.
 
 - Concurrency: at most 32 sessions (`MAX_SESSIONS`), backpressure not
-  rejection — excess connections queue for a slot. This caps host daemon
-  forks; sessions map 1:1 to upstream connections.
+  rejection. The permit is taken before accept, so excess connections wait
+  in the kernel listen backlog (no proxy fds); a connect flood ends up
+  blocking guest-side. This caps host daemon forks; sessions map 1:1 to
+  upstream connections.
 - The host daemon is dialed only after the guest sends valid protocol
   magic, so a connect-and-stall client costs the host nothing.
 - Guest strings cap at 64 KiB (`MAX_GUEST_STRING`; a real store path is at
