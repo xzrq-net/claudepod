@@ -37,6 +37,26 @@ source of the WAL staleness problem (see README "Caveats").
   off host daemon mutations. The proxy connects to the host daemon as the
   invoking user (untrusted client), which is sufficient for all allowed ops.
 
+## Limits
+
+The guest is untrusted; the proxy bounds what it can cost the host. The
+bounds are derived from the protocol where possible, generous everywhere —
+they exist to stop abuse, not to police a healthy client.
+
+- Concurrency: at most 32 sessions (`MAX_SESSIONS`), backpressure not
+  rejection — excess connections queue for a slot. This caps host daemon
+  forks; sessions map 1:1 to upstream connections.
+- The host daemon is dialed only after the guest sends valid protocol
+  magic, so a connect-and-stall client costs the host nothing.
+- Guest strings cap at 64 KiB (`MAX_GUEST_STRING`; a real store path is at
+  most store dir + 245 bytes — nix caps the name component at 211), feature
+  lists at 256 entries. The feature list is the only place guest bytes
+  accumulate; everything else streams. Host-leg strings keep a coarse
+  16 MiB cap (`MAX_HOST_STRING`) — the host daemon is trusted.
+- Timeouts: 60s per guest handshake step and per-op argument transfer. None
+  at op boundaries, where pooled guest connections idle legitimately, and
+  none on host reads (trusted, and queries can take a while under load).
+
 ## Protocol version policy
 
 - Handshake order: upstream (host daemon) first, take the negotiated version,

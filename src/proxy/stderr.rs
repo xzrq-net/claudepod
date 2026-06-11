@@ -49,14 +49,14 @@ where
             }
             STDERR_NEXT => {
                 wire::write_u64(guest, msg).await?;
-                wire::copy_string(host, guest).await?;
+                wire::copy_string(host, guest, wire::MAX_HOST_STRING).await?;
             }
             STDERR_START_ACTIVITY => {
                 wire::write_u64(guest, msg).await?;
                 wire::copy_u64(host, guest).await?; // activity id
                 wire::copy_u64(host, guest).await?; // verbosity
                 wire::copy_u64(host, guest).await?; // activity type
-                wire::copy_string(host, guest).await?; // text
+                wire::copy_string(host, guest, wire::MAX_HOST_STRING).await?; // text
                 copy_fields(host, guest).await?;
                 wire::copy_u64(host, guest).await?; // parent activity id
             }
@@ -106,7 +106,7 @@ where
             0 => {
                 wire::copy_u64(host, guest).await?;
             }
-            1 => wire::copy_string(host, guest).await?,
+            1 => wire::copy_string(host, guest, wire::MAX_HOST_STRING).await?,
             t => bail!("unsupported logger field type {t}"),
         }
     }
@@ -120,10 +120,10 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    wire::copy_string(host, guest).await?; // type, always "Error"
+    wire::copy_string(host, guest, wire::MAX_HOST_STRING).await?; // type, always "Error"
     wire::copy_u64(host, guest).await?; // verbosity level
-    wire::copy_string(host, guest).await?; // name (removed field)
-    wire::copy_string(host, guest).await?; // message
+    wire::copy_string(host, guest, wire::MAX_HOST_STRING).await?; // name (removed field)
+    wire::copy_string(host, guest, wire::MAX_HOST_STRING).await?; // message
     let have_pos = wire::copy_u64(host, guest).await?;
     ensure!(have_pos == 0, "error positions are not supported");
     let traces = wire::copy_u64(host, guest).await?;
@@ -134,7 +134,7 @@ where
     for _ in 0..traces {
         let have_pos = wire::copy_u64(host, guest).await?;
         ensure!(have_pos == 0, "error positions are not supported");
-        wire::copy_string(host, guest).await?; // trace message
+        wire::copy_string(host, guest, wire::MAX_HOST_STRING).await?; // trace message
     }
     Ok(())
 }

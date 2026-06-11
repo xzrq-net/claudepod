@@ -3,9 +3,11 @@
 //! loudly rejects everything else. See docs/nix-proxy.md.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::Result;
 use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::Semaphore;
 
 pub mod handshake;
 pub mod ops;
@@ -13,9 +15,17 @@ pub mod session;
 pub mod stderr;
 pub mod wire;
 
+/// Cap on concurrent sessions, and thereby on host daemon connections (the
+/// host daemon forks a child per connection). Backpressure, not rejection:
+/// excess connections queue for a slot. Sessions map 1:1 to nix clients
+/// inside the guest (one pooled lower-store connection per forked guest
+/// daemon child), so a legitimate workload rarely needs more than a few.
+const MAX_SESSIONS: usize = 32;
+
 /// Accept loop. One relay session per connection; the guest daemon uses a
 /// connection pool, so concurrent sessions are normal.
 pub async fn serve(listener: UnixListener, upstream: PathBuf) -> Result<()> {
+    let limiter = Arc::new(Semaphore::new(MAX_SESSIONS));
     loop {
         // Accept errors (e.g. transient EMFILE) must not take down the
         // sessions already running.
@@ -28,7 +38,10 @@ pub async fn serve(listener: UnixListener, upstream: PathBuf) -> Result<()> {
             }
         };
         let upstream = upstream.clone();
+        let limiter = limiter.clone();
         tokio::spawn(async move {
+            // Never closed, so acquire cannot fail.
+            let _permit = limiter.acquire_owned().await.unwrap();
             if let Err(err) = relay(guest, &upstream).await {
                 eprintln!("claudepod-nix-proxy: session failed: {err:#}");
             }
@@ -37,10 +50,12 @@ pub async fn serve(listener: UnixListener, upstream: PathBuf) -> Result<()> {
 }
 
 async fn relay(guest: UnixStream, upstream: &Path) -> Result<()> {
-    let host = UnixStream::connect(upstream).await?;
     let (guest_r, guest_w) = guest.into_split();
-    let (host_r, host_w) = host.into_split();
-    session::run(guest_r, guest_w, host_r, host_w).await
+    session::run(guest_r, guest_w, || async {
+        let host = UnixStream::connect(upstream).await?;
+        Ok(host.into_split())
+    })
+    .await
 }
 
 #[cfg(test)]

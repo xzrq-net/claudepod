@@ -1,48 +1,76 @@
 //! Per-connection relay state machine: handshakes, post-handshake exchange,
 //! then the op loop.
 
+use std::future::Future;
+use std::time::Duration;
+
 use anyhow::{Context, Result, bail};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
 
 use super::{handshake, ops, stderr, wire};
 
+/// A healthy guest streams continuously through handshake steps and op
+/// arguments; only at op boundaries may a (pooled) connection idle, so
+/// these can be aggressive without ever killing a healthy connection.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
+const ARGS_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Drive one guest connection against one host daemon connection until the
-/// guest hangs up or a protocol violation kills the session.
-pub async fn run<GR, GW, HR, HW>(guest_r: GR, guest_w: GW, host_r: HR, host_w: HW) -> Result<()>
+/// guest hangs up or a protocol violation kills the session. `connect`
+/// dials the host daemon; it runs only after the guest has sent valid
+/// protocol magic, so a stalling client never costs the host a daemon fork.
+pub async fn run<GR, GW, HR, HW, C, F>(guest_r: GR, guest_w: GW, connect: C) -> Result<()>
 where
     GR: AsyncRead + Unpin,
     GW: AsyncWrite + Unpin,
     HR: AsyncRead + Unpin,
     HW: AsyncWrite + Unpin,
+    C: FnOnce() -> F,
+    F: Future<Output = Result<(HR, HW)>>,
 {
     let mut gr = BufReader::new(guest_r);
     let mut gw = BufWriter::new(guest_w);
+
+    within(HANDSHAKE_TIMEOUT, handshake::guest_magic(&mut gr))
+        .await
+        .context("guest handshake")?;
+
+    let (host_r, host_w) = connect().await.context("dial host daemon")?;
     let mut hr = BufReader::new(host_r);
     let mut hw = BufWriter::new(host_w);
 
     let negotiated = handshake::upstream(&mut hr, &mut hw)
         .await
         .context("host daemon handshake")?;
-    handshake::downstream(&mut gr, &mut gw, &negotiated)
-        .await
-        .context("guest handshake")?;
+    within(
+        HANDSHAKE_TIMEOUT,
+        handshake::downstream(&mut gr, &mut gw, &negotiated),
+    )
+    .await
+    .context("guest handshake")?;
 
     // Client post-handshake fields: obsolete CPU affinity (a nonzero word is
     // followed by the affinity value), obsolete reserveSpace.
-    if wire::copy_u64(&mut gr, &mut hw).await? != 0 {
-        wire::copy_u64(&mut gr, &mut hw).await?;
-    }
-    wire::copy_u64(&mut gr, &mut hw).await?;
+    within(HANDSHAKE_TIMEOUT, async {
+        if wire::copy_u64(&mut gr, &mut hw).await? != 0 {
+            wire::copy_u64(&mut gr, &mut hw).await?;
+        }
+        wire::copy_u64(&mut gr, &mut hw).await
+    })
+    .await
+    .context("guest post-handshake")?;
     hw.flush().await?;
 
     // Daemon handshake info (nix version string, trusted flag), then the
     // greeting stderr exchange.
-    wire::copy_string(&mut hr, &mut gw).await?;
+    wire::copy_string(&mut hr, &mut gw, wire::MAX_HOST_STRING).await?;
     wire::copy_u64(&mut hr, &mut gw).await?;
     stderr::relay(&mut hr, &mut gw).await.context("greeting")?;
     gw.flush().await?;
 
     loop {
+        // No timeout here: the guest daemon pools connections, and a pooled
+        // connection legitimately idles between ops indefinitely.
         let Some(word) = wire::read_u64_or_eof(&mut gr).await? else {
             return Ok(()); // guest hung up between ops
         };
@@ -63,8 +91,11 @@ where
             // depend on client settings, and forwarding would hand the guest
             // unclamped host daemon settings whenever the invoking user is
             // in trusted-users (daemon.cc `ClientSettings::apply`).
-            if let Err(err) =
-                ops::copy_args(op, &negotiated, &mut gr, &mut tokio::io::sink()).await
+            if let Err(err) = within(
+                ARGS_TIMEOUT,
+                ops::copy_args(op, &negotiated, &mut gr, &mut tokio::io::sink()),
+            )
+            .await
             {
                 let err = err.context(format!("{} arguments", op.name()));
                 let _ = stderr::write_error(&mut gw, &format!("{err:#}")).await;
@@ -76,7 +107,12 @@ where
         }
 
         wire::write_u64(&mut hw, word).await?;
-        if let Err(err) = ops::copy_args(op, &negotiated, &mut gr, &mut hw).await {
+        if let Err(err) = within(
+            ARGS_TIMEOUT,
+            ops::copy_args(op, &negotiated, &mut gr, &mut hw),
+        )
+        .await
+        {
             let err = err.context(format!("{} arguments", op.name()));
             let _ = stderr::write_error(&mut gw, &format!("{err:#}")).await;
             return Err(err);
@@ -98,6 +134,14 @@ where
                 .with_context(|| format!("{} result", op.name()))?;
         }
         gw.flush().await?;
+    }
+}
+
+/// `tokio::time::timeout` flattened into the session's error type.
+async fn within<T>(limit: Duration, fut: impl Future<Output = Result<T>>) -> Result<T> {
+    match tokio::time::timeout(limit, fut).await {
+        Ok(result) => result,
+        Err(_) => bail!("timed out after {}s", limit.as_secs()),
     }
 }
 
@@ -136,12 +180,9 @@ mod tests {
     async fn run_session(guest_in: &[u8], host_in: &[u8]) -> (Result<()>, Vec<u8>, Vec<u8>) {
         let mut guest_out = Vec::new();
         let mut host_out = Vec::new();
-        let result = run(
-            &mut &guest_in[..],
-            &mut guest_out,
-            &mut &host_in[..],
-            &mut host_out,
-        )
+        let result = run(&mut &guest_in[..], &mut guest_out, || async {
+            Ok((host_in, &mut host_out))
+        })
         .await;
         (result, guest_out, host_out)
     }

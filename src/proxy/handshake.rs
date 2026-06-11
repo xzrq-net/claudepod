@@ -60,6 +60,8 @@ pub const OUR_FEATURES: &[&str] = &[];
 pub const FEATURE_REALISATION_WITH_PATH: &str = "realisation-with-path";
 /// The feature exchange exists from protocol 1.38.
 const FEATURE_EXCHANGE: Version = Version::new(1, 38);
+/// Cap on an advertised feature list. Real lists have a handful of entries.
+const MAX_FEATURES: u64 = 256;
 
 /// Version and feature set shared by both legs of a session.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -116,15 +118,22 @@ where
     Ok(Negotiated { version, features })
 }
 
-/// Server-side handshake toward the guest, advertising exactly the
-/// upstream-negotiated version and features.
+/// Read and validate the guest's opening magic. Split from `downstream` so
+/// the session can vet the guest before spending a host daemon connection
+/// (the host daemon forks a child per connection).
+pub async fn guest_magic<R: AsyncRead + Unpin>(r: &mut R) -> Result<()> {
+    let magic = wire::read_u64(r).await?;
+    ensure!(magic == WORKER_MAGIC_1, "guest sent bad magic {magic:#x}");
+    Ok(())
+}
+
+/// Server-side handshake toward the guest (after `guest_magic`), advertising
+/// exactly the upstream-negotiated version and features.
 pub async fn downstream<R, W>(r: &mut R, w: &mut W, negotiated: &Negotiated) -> Result<()>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let magic = wire::read_u64(r).await?;
-    ensure!(magic == WORKER_MAGIC_1, "guest sent bad magic {magic:#x}");
     wire::write_u64(w, WORKER_MAGIC_2).await?;
     wire::write_u64(w, negotiated.version.to_wire()).await?;
     w.flush().await?;
@@ -153,7 +162,7 @@ where
 }
 
 async fn read_features<R: AsyncRead + Unpin>(r: &mut R) -> Result<BTreeSet<String>> {
-    wire::read_string_list(r)
+    wire::read_string_list(r, MAX_FEATURES, wire::MAX_GUEST_STRING)
         .await?
         .into_iter()
         .map(|f| String::from_utf8(f).context("protocol feature name is not UTF-8"))
@@ -253,10 +262,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn guest_magic_accepts_and_rejects() {
+        let mut script = Vec::new();
+        put_u64(&mut script, WORKER_MAGIC_1);
+        guest_magic(&mut script.as_slice()).await.unwrap();
+
+        let mut script = Vec::new();
+        put_u64(&mut script, 0xdead);
+        let err = guest_magic(&mut script.as_slice()).await.unwrap_err();
+        assert!(err.to_string().contains("magic"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn rejects_oversized_feature_list() {
+        let mut script = daemon_greeting(0x126);
+        put_u64(&mut script, MAX_FEATURES + 1);
+        let (result, _) = run_upstream(&script).await;
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("exceeds limit"), "{err}");
+    }
+
+    #[tokio::test]
     async fn downstream_happy_path() {
         let neg = negotiated(38, &["realisation-with-path"]);
         let mut script = Vec::new();
-        put_u64(&mut script, WORKER_MAGIC_1);
         put_u64(&mut script, 0x126);
         put_u64(&mut script, 2);
         put_str(&mut script, b"disable-set-options");
@@ -277,7 +306,6 @@ mod tests {
     async fn downstream_rejects_older_guest() {
         let neg = negotiated(38, &[]);
         let mut script = Vec::new();
-        put_u64(&mut script, WORKER_MAGIC_1);
         put_u64(&mut script, 0x125);
         let (result, _) = run_downstream(&script, &neg).await;
         let err = result.unwrap_err();
@@ -288,7 +316,6 @@ mod tests {
     async fn downstream_rejects_missing_feature() {
         let neg = negotiated(38, &["realisation-with-path"]);
         let mut script = Vec::new();
-        put_u64(&mut script, WORKER_MAGIC_1);
         put_u64(&mut script, 0x126);
         put_u64(&mut script, 0); // guest has no features
         let (result, _) = run_downstream(&script, &neg).await;
@@ -300,7 +327,6 @@ mod tests {
     async fn downstream_newer_guest_is_fine() {
         let neg = negotiated(37, &[]);
         let mut script = Vec::new();
-        put_u64(&mut script, WORKER_MAGIC_1);
         put_u64(&mut script, 0x12a);
         let (result, _) = run_downstream(&script, &neg).await;
         result.unwrap();

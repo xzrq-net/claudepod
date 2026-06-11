@@ -115,9 +115,11 @@ where
         | Op::QueryReferrers
         | Op::QueryPathInfo
         | Op::QueryValidDerivers
-        | Op::QueryPathFromHashPart => wire::copy_string(guest, host).await?,
+        | Op::QueryPathFromHashPart => {
+            wire::copy_string(guest, host, wire::MAX_GUEST_STRING).await?
+        }
         Op::QueryValidPaths => {
-            wire::copy_string_list(guest, host).await?;
+            wire::copy_string_list(guest, host, wire::MAX_GUEST_STRING).await?;
             // The substitute flag would make the host daemon fetch paths on
             // our behalf — a mutation. The local-overlay store never asks
             // for it (default NoSubstitute).
@@ -143,18 +145,18 @@ where
                 "override count {overrides} exceeds limit"
             );
             for _ in 0..overrides {
-                wire::copy_string(guest, host).await?; // name
-                wire::copy_string(guest, host).await?; // value
+                wire::copy_string(guest, host, wire::MAX_GUEST_STRING).await?; // name
+                wire::copy_string(guest, host, wire::MAX_GUEST_STRING).await?; // value
             }
         }
         Op::QueryRealisation => {
             if negotiated.realisation_with_path() {
                 // DrvOutput: derivation store path + output name.
-                wire::copy_string(guest, host).await?;
-                wire::copy_string(guest, host).await?;
+                wire::copy_string(guest, host, wire::MAX_GUEST_STRING).await?;
+                wire::copy_string(guest, host, wire::MAX_GUEST_STRING).await?;
             } else {
                 // Rendered "drvhash!output" id.
-                wire::copy_string(guest, host).await?;
+                wire::copy_string(guest, host, wire::MAX_GUEST_STRING).await?;
             }
         }
     }
@@ -180,10 +182,10 @@ where
             wire::copy_u64(host, guest).await?;
         }
         Op::QueryReferrers | Op::QueryValidPaths | Op::QueryValidDerivers => {
-            wire::copy_string_list(host, guest).await?;
+            wire::copy_string_list(host, guest, wire::MAX_HOST_STRING).await?;
         }
         // Optional store path; empty string means not found.
-        Op::QueryPathFromHashPart => wire::copy_string(host, guest).await?,
+        Op::QueryPathFromHashPart => wire::copy_string(host, guest, wire::MAX_HOST_STRING).await?,
         Op::QueryPathInfo => {
             let valid = wire::copy_u64(host, guest).await?;
             if valid != 0 {
@@ -196,13 +198,13 @@ where
                 let tag = wire::copy_u64(host, guest).await?;
                 ensure!(tag <= 1, "invalid optional tag {tag}");
                 if tag == 1 {
-                    wire::copy_string(host, guest).await?; // output store path
-                    wire::copy_string_list(host, guest).await?; // signatures
+                    wire::copy_string(host, guest, wire::MAX_HOST_STRING).await?; // output store path
+                    wire::copy_string_list(host, guest, wire::MAX_HOST_STRING).await?; // signatures
                 }
             } else {
                 // Pre-feature daemons return a set of strings (realisations
                 // as JSON from 1.31, bare store paths before that).
-                wire::copy_string_list(host, guest).await?;
+                wire::copy_string_list(host, guest, wire::MAX_HOST_STRING).await?;
             }
         }
     }
@@ -216,14 +218,14 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    wire::copy_string(host, guest).await?; // deriver (optional store path)
-    wire::copy_string(host, guest).await?; // narHash (base16)
-    wire::copy_string_list(host, guest).await?; // references
+    wire::copy_string(host, guest, wire::MAX_HOST_STRING).await?; // deriver (optional store path)
+    wire::copy_string(host, guest, wire::MAX_HOST_STRING).await?; // narHash (base16)
+    wire::copy_string_list(host, guest, wire::MAX_HOST_STRING).await?; // references
     wire::copy_u64(host, guest).await?; // registrationTime
     wire::copy_u64(host, guest).await?; // narSize
     wire::copy_u64(host, guest).await?; // ultimate
-    wire::copy_string_list(host, guest).await?; // sigs
-    wire::copy_string(host, guest).await?; // ca (optional)
+    wire::copy_string_list(host, guest, wire::MAX_HOST_STRING).await?; // sigs
+    wire::copy_string(host, guest, wire::MAX_HOST_STRING).await?; // ca (optional)
     Ok(())
 }
 
