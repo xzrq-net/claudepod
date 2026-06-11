@@ -91,32 +91,14 @@ where
             // depend on client settings, and forwarding would hand the guest
             // unclamped host daemon settings whenever the invoking user is
             // in trusted-users (daemon.cc `ClientSettings::apply`).
-            if let Err(err) = within(
-                ARGS_TIMEOUT,
-                ops::copy_args(op, &negotiated, &mut gr, &mut tokio::io::sink()),
-            )
-            .await
-            {
-                let err = err.context(format!("{} arguments", op.name()));
-                let _ = stderr::write_error(&mut gw, &format!("{err:#}")).await;
-                return Err(err);
-            }
+            relay_args(op, &negotiated, &mut gr, &mut tokio::io::sink(), &mut gw).await?;
             wire::write_u64(&mut gw, stderr::STDERR_LAST).await?;
             gw.flush().await?;
             continue;
         }
 
         wire::write_u64(&mut hw, word).await?;
-        if let Err(err) = within(
-            ARGS_TIMEOUT,
-            ops::copy_args(op, &negotiated, &mut gr, &mut hw),
-        )
-        .await
-        {
-            let err = err.context(format!("{} arguments", op.name()));
-            let _ = stderr::write_error(&mut gw, &format!("{err:#}")).await;
-            return Err(err);
-        }
+        relay_args(op, &negotiated, &mut gr, &mut hw, &mut gw).await?;
         hw.flush().await?;
 
         // No synthetic error on failure: relay() may have left the guest
@@ -134,6 +116,31 @@ where
                 .with_context(|| format!("{} result", op.name()))?;
         }
         gw.flush().await?;
+    }
+}
+
+/// Copy an op's arguments guest-to-`dest` under the args timeout. On
+/// failure, nothing has been sent guestward for this op yet, so the guest
+/// still gets a parseable synthetic error before the session dies.
+async fn relay_args<R, W, G>(
+    op: ops::Op,
+    negotiated: &handshake::Negotiated,
+    guest: &mut R,
+    dest: &mut W,
+    guest_w: &mut G,
+) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+    G: AsyncWrite + Unpin,
+{
+    match within(ARGS_TIMEOUT, ops::copy_args(op, negotiated, guest, dest)).await {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            let err = err.context(format!("{} arguments", op.name()));
+            let _ = stderr::write_error(guest_w, &format!("{err:#}")).await;
+            Err(err)
+        }
     }
 }
 

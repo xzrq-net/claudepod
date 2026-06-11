@@ -11,45 +11,39 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use super::handshake::Negotiated;
 use super::wire;
 
+/// The allowed ops; discriminants are the protocol op words.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u64)]
 pub enum Op {
-    IsValidPath,
-    QueryReferrers,
-    SetOptions,
-    QueryPathInfo,
-    QueryPathFromHashPart,
-    QueryValidPaths,
-    QueryValidDerivers,
-    QueryRealisation,
+    IsValidPath = 1,
+    QueryReferrers = 6,
+    SetOptions = 19,
+    QueryPathInfo = 26,
+    QueryPathFromHashPart = 29,
+    QueryValidPaths = 31,
+    QueryValidDerivers = 33,
+    QueryRealisation = 43,
 }
 
 impl Op {
     /// The allowlist: op word to allowed op.
     pub fn allowed(word: u64) -> Option<Op> {
-        Some(match word {
-            1 => Op::IsValidPath,
-            6 => Op::QueryReferrers,
-            19 => Op::SetOptions,
-            26 => Op::QueryPathInfo,
-            29 => Op::QueryPathFromHashPart,
-            31 => Op::QueryValidPaths,
-            33 => Op::QueryValidDerivers,
-            43 => Op::QueryRealisation,
-            _ => return None,
-        })
+        [
+            Op::IsValidPath,
+            Op::QueryReferrers,
+            Op::SetOptions,
+            Op::QueryPathInfo,
+            Op::QueryPathFromHashPart,
+            Op::QueryValidPaths,
+            Op::QueryValidDerivers,
+            Op::QueryRealisation,
+        ]
+        .into_iter()
+        .find(|&op| op as u64 == word)
     }
 
     pub fn name(self) -> &'static str {
-        match self {
-            Op::IsValidPath => "IsValidPath",
-            Op::QueryReferrers => "QueryReferrers",
-            Op::SetOptions => "SetOptions",
-            Op::QueryPathInfo => "QueryPathInfo",
-            Op::QueryPathFromHashPart => "QueryPathFromHashPart",
-            Op::QueryValidPaths => "QueryValidPaths",
-            Op::QueryValidDerivers => "QueryValidDerivers",
-            Op::QueryRealisation => "QueryRealisation",
-        }
+        op_name(self as u64)
     }
 }
 

@@ -58,10 +58,6 @@ struct Env {
     host_state: PathBuf,
     host_socket: PathBuf,
     proxy_socket: PathBuf,
-    /// Read-only bind mount of the host store, the overlay's lowerdir —
-    /// stands in for the `/nix/store:ro` volume in the real setup.
-    guest_lower: PathBuf,
-    guest_root: PathBuf,
     guest_upper: PathBuf,
     guest_state: PathBuf,
     guest_socket: PathBuf,
@@ -477,8 +473,6 @@ impl Env {
             host_state: root.join("host/var/nix"),
             host_socket: root.join("host/var/nix/daemon-socket/socket"),
             proxy_socket: root.join("proxy.sock"),
-            guest_lower: root.join("guest/lower"),
-            guest_root: root.join("guest/root"),
             guest_upper: root.join("guest/upper"),
             guest_state: root.join("guest/var/nix"),
             guest_socket: root.join("guest/var/nix/daemon-socket/socket"),
@@ -495,14 +489,17 @@ impl Env {
         )
         .context("mount tmpfs")?;
 
+        // Read-only bind mount of the host store, the overlay's lowerdir —
+        // stands in for the `/nix/store:ro` volume in the real setup.
+        let guest_lower = root.join("guest/lower");
         let guest_work = root.join("guest/work");
-        let guest_merged = env.guest_root.join("nix/store");
+        let guest_merged = root.join("guest/root/nix/store");
         for dir in [
             &env.store,
             &env.home,
             &env.conf,
             &env.host_state,
-            &env.guest_lower,
+            &guest_lower,
             &env.guest_upper,
             &guest_work,
             &env.guest_state,
@@ -526,7 +523,7 @@ impl Env {
 
         mount(
             Some(&env.store),
-            &env.guest_lower,
+            &guest_lower,
             None::<&str>,
             MsFlags::MS_BIND,
             None::<&str>,
@@ -534,7 +531,7 @@ impl Env {
         .context("bind mount lower store")?;
         mount(
             None::<&str>,
-            &env.guest_lower,
+            &guest_lower,
             None::<&str>,
             MsFlags::MS_REMOUNT | MsFlags::MS_BIND | MsFlags::MS_RDONLY,
             None::<&str>,
@@ -543,7 +540,7 @@ impl Env {
 
         let overlay_opts = format!(
             "lowerdir={},upperdir={},workdir={}",
-            env.guest_lower.display(),
+            guest_lower.display(),
             env.guest_upper.display(),
             guest_work.display(),
         );

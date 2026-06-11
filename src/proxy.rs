@@ -9,11 +9,11 @@ use anyhow::Result;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Semaphore;
 
-pub mod handshake;
-pub mod ops;
-pub mod session;
-pub mod stderr;
-pub mod wire;
+mod handshake;
+mod ops;
+mod session;
+mod stderr;
+mod wire;
 
 /// Cap on concurrent sessions, and thereby on host daemon connections (the
 /// host daemon forks a child per connection). Backpressure, not rejection:

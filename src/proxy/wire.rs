@@ -46,10 +46,13 @@ pub async fn write_u64<W: AsyncWrite + Unpin>(w: &mut W, v: u64) -> Result<()> {
 
 pub async fn read_string<R: AsyncRead + Unpin>(r: &mut R, max_len: u64) -> Result<Vec<u8>> {
     let len = read_u64(r).await?;
-    ensure!(len <= max_len, "string length {len} exceeds limit {max_len}");
+    ensure!(
+        len <= max_len,
+        "string length {len} exceeds limit {max_len}"
+    );
     let mut buf = vec![0; len as usize];
     r.read_exact(&mut buf).await?;
-    if len % 8 != 0 {
+    if !len.is_multiple_of(8) {
         let mut pad = [0u8; 8];
         r.read_exact(&mut pad[..(8 - len % 8) as usize]).await?;
         ensure!(pad == [0u8; 8], "non-zero string padding");
@@ -72,7 +75,10 @@ pub async fn read_string_list<R: AsyncRead + Unpin>(
     max_len: u64,
 ) -> Result<Vec<Vec<u8>>> {
     let count = read_u64(r).await?;
-    ensure!(count <= max_count, "string count {count} exceeds limit {max_count}");
+    ensure!(
+        count <= max_count,
+        "string count {count} exceeds limit {max_count}"
+    );
     let mut items = Vec::with_capacity(count as usize);
     for _ in 0..count {
         items.push(read_string(r, max_len).await?);
@@ -80,11 +86,12 @@ pub async fn read_string_list<R: AsyncRead + Unpin>(
     Ok(items)
 }
 
-pub async fn write_string_list<W: AsyncWrite + Unpin>(
-    w: &mut W,
-    items: impl IntoIterator<Item = impl AsRef<[u8]>>,
-) -> Result<()> {
-    let items = items.into_iter().collect::<Vec<_>>();
+pub async fn write_string_list<W, I>(w: &mut W, items: I) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+    I: IntoIterator<Item: AsRef<[u8]>, IntoIter: ExactSizeIterator>,
+{
+    let items = items.into_iter();
     write_u64(w, items.len() as u64).await?;
     for item in items {
         write_string(w, item.as_ref()).await?;
@@ -147,7 +154,9 @@ mod tests {
         expected.extend([0, 0, 0]);
         assert_eq!(out, expected);
         assert_eq!(
-            read_string(&mut out.as_slice(), MAX_GUEST_STRING).await.unwrap(),
+            read_string(&mut out.as_slice(), MAX_GUEST_STRING)
+                .await
+                .unwrap(),
             b"hello"
         );
     }
@@ -158,7 +167,9 @@ mod tests {
         write_string(&mut out, b"12345678").await.unwrap();
         assert_eq!(out.len(), 16);
         assert_eq!(
-            read_string(&mut out.as_slice(), MAX_GUEST_STRING).await.unwrap(),
+            read_string(&mut out.as_slice(), MAX_GUEST_STRING)
+                .await
+                .unwrap(),
             b"12345678"
         );
     }
@@ -169,7 +180,9 @@ mod tests {
         write_string(&mut out, b"").await.unwrap();
         assert_eq!(out, [0u8; 8]);
         assert_eq!(
-            read_string(&mut out.as_slice(), MAX_GUEST_STRING).await.unwrap(),
+            read_string(&mut out.as_slice(), MAX_GUEST_STRING)
+                .await
+                .unwrap(),
             b""
         );
     }
@@ -242,7 +255,9 @@ mod tests {
         let mut input = buf.as_slice();
         let mut out = Vec::new();
         assert_eq!(copy_u64(&mut input, &mut out).await.unwrap(), 42);
-        copy_string(&mut input, &mut out, MAX_GUEST_STRING).await.unwrap();
+        copy_string(&mut input, &mut out, MAX_GUEST_STRING)
+            .await
+            .unwrap();
         assert_eq!(out, buf);
     }
 }
