@@ -22,9 +22,11 @@ source of the WAL staleness problem (see README "Caveats").
 - Reject = synthesize `STDERR_ERROR` with a descriptive message, then close
   the connection. Closing avoids ever having to drain framed payloads of
   mutating ops, and an unexpected op from the lower store is a bug we want
-  loud. SetOptions carries client settings; we parse it for framing and
-  forward it (the host daemon already clamps settings from untrusted
-  clients).
+  loud. SetOptions is special-cased: parsed for framing, swallowed, answered
+  with a synthetic empty success. None of the allowed ops depend on client
+  settings, and forwarding would apply guest-chosen settings unclamped on
+  the host daemon whenever the invoking user is in `trusted-users`
+  (daemon.cc `ClientSettings::apply`).
 - Hand-rolled wire format, no nix-wire dependency. The allowed subset is
   primitives only (u64 LE, padded length-prefixed strings, string sets); all
   protocol complexity (framed sources, NAR streaming, build results) lives in
@@ -53,7 +55,7 @@ Complete demand set, enumerated from every `lowerStore->` call site in nix
 
 | Op | # | Notes |
 |---|---|---|
-| SetOptions | 19 | connection setup; parse for framing, forward |
+| SetOptions | 19 | connection setup; parse for framing, swallow (never forwarded) |
 | IsValidPath | 1 | |
 | QueryReferrers | 6 | |
 | QueryPathInfo | 26 | result is ValidPathInfo (all primitives) |

@@ -130,8 +130,10 @@ where
         }
         Op::SetOptions => {
             // ClientSettings (daemon.cc): 12 scalar fields, then counted
-            // name/value override pairs. The host daemon clamps settings
-            // from untrusted clients, so forwarding is safe.
+            // name/value override pairs. Parsed for framing only — the
+            // session swallows SetOptions instead of forwarding it. New
+            // fields must be protocol-gated, so this layout is frozen until
+            // OUR_VERSION moves (see AGENTS.md).
             for _ in 0..12 {
                 wire::copy_u64(guest, host).await?;
             }
@@ -171,6 +173,8 @@ where
     W: AsyncWrite + Unpin,
 {
     match op {
+        // Swallowed by the session, never forwarded; nothing to relay even
+        // if it were (the result payload is empty).
         Op::SetOptions => {}
         Op::IsValidPath => {
             wire::copy_u64(host, guest).await?;

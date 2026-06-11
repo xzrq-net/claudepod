@@ -57,6 +57,24 @@ where
             bail!(msg);
         };
 
+        if op == ops::Op::SetOptions {
+            // Swallowed, not forwarded: parse for framing, then synthesize
+            // the empty success the guest expects. None of the allowed ops
+            // depend on client settings, and forwarding would hand the guest
+            // unclamped host daemon settings whenever the invoking user is
+            // in trusted-users (daemon.cc `ClientSettings::apply`).
+            if let Err(err) =
+                ops::copy_args(op, &negotiated, &mut gr, &mut tokio::io::sink()).await
+            {
+                let err = err.context(format!("{} arguments", op.name()));
+                let _ = stderr::write_error(&mut gw, &format!("{err:#}")).await;
+                return Err(err);
+            }
+            wire::write_u64(&mut gw, stderr::STDERR_LAST).await?;
+            gw.flush().await?;
+            continue;
+        }
+
         wire::write_u64(&mut hw, word).await?;
         if let Err(err) = ops::copy_args(op, &negotiated, &mut gr, &mut hw).await {
             let err = err.context(format!("{} arguments", op.name()));
@@ -164,6 +182,53 @@ mod tests {
         put_u64(&mut expected_guest, stderr::STDERR_LAST);
         put_u64(&mut expected_guest, stderr::STDERR_LAST);
         put_u64(&mut expected_guest, 1);
+        assert_eq!(guest_out, expected_guest);
+    }
+
+    #[tokio::test]
+    async fn set_options_is_swallowed() {
+        let mut guest_in = guest_script();
+        put_u64(&mut guest_in, 19); // SetOptions
+        for _ in 0..12 {
+            put_u64(&mut guest_in, 0); // scalar fields
+        }
+        put_u64(&mut guest_in, 1); // one override
+        put_str(&mut guest_in, b"substituters");
+        put_str(&mut guest_in, b"https://evil.example");
+        put_u64(&mut guest_in, 1); // IsValidPath, to prove the loop survives
+        put_str(&mut guest_in, b"/nix/store/abc-foo");
+
+        let mut host_in = host_script();
+        // The host script only answers IsValidPath; SetOptions never gets there.
+        put_u64(&mut host_in, stderr::STDERR_LAST);
+        put_u64(&mut host_in, 1);
+
+        let (result, guest_out, host_out) = run_session(&guest_in, &host_in).await;
+        result.unwrap();
+
+        // Toward the host: handshake and IsValidPath, no trace of SetOptions.
+        let mut expected_host = Vec::new();
+        put_u64(&mut expected_host, WORKER_MAGIC_1);
+        put_u64(&mut expected_host, VERSION_1_38);
+        put_u64(&mut expected_host, 0); // our (empty) feature list
+        put_u64(&mut expected_host, 0);
+        put_u64(&mut expected_host, 0);
+        put_u64(&mut expected_host, 1);
+        put_str(&mut expected_host, b"/nix/store/abc-foo");
+        assert_eq!(host_out, expected_host);
+
+        // Toward the guest: a synthetic empty success for SetOptions,
+        // then the real IsValidPath exchange.
+        let mut expected_guest = Vec::new();
+        put_u64(&mut expected_guest, WORKER_MAGIC_2);
+        put_u64(&mut expected_guest, VERSION_1_38);
+        put_u64(&mut expected_guest, 0); // negotiated (empty) feature list
+        put_str(&mut expected_guest, b"2.34.7");
+        put_u64(&mut expected_guest, 2);
+        put_u64(&mut expected_guest, stderr::STDERR_LAST); // greeting
+        put_u64(&mut expected_guest, stderr::STDERR_LAST); // synthetic SetOptions success
+        put_u64(&mut expected_guest, stderr::STDERR_LAST); // IsValidPath stderr
+        put_u64(&mut expected_guest, 1); // IsValidPath result
         assert_eq!(guest_out, expected_guest);
     }
 
