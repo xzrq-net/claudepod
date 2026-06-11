@@ -154,19 +154,38 @@ unprivileged, can mount, and the pid namespace reaps the daemons on exit:
    socket — in-process so test failures have backtraces and coverage.
 4. Run a second real `nix-daemon` with `NIX_REMOTE=local-overlay://…` whose
    lower store is the proxy socket — this is the "container" daemon.
-5. Issue requests through the container daemon (path-info, validity of
-   host-only paths, references) and assert results.
+   Everything guest-side (daemon, clients, builders) runs in an extra mount
+   namespace where the merged overlay is bound over the logical store dir,
+   mirroring the container's view of /nix/store: nix clients are
+   LocalFSStores that read store files directly at the logical path, so a
+   daemon socket alone is not enough. (Beware `root=`: with it set, `real`
+   defaults to `<root>/nix/store` regardless of the logical store dir.)
+5. Issue requests through the container daemon and assert results.
 
-Key scenarios:
+Key scenarios, one test each in `claudepod-e2e.rs` (doc comments there state
+the layer friction each one pins):
 
-- WAL regression test: add a path via the host daemon (db change sits in the
-  host WAL), then immediately query it through the container daemon. This is
-  exactly the case that fails today.
-- Closure sync: validity check of a host path pulls its `ValidPathInfo` and
-  reference closure into the upper db (`local-overlay-store.cc:143-159`).
-- Rejection: speak the wire protocol directly to the proxy socket, send a
-  disallowed op, assert `STDERR_ERROR` + close.
-- Guest build that depends on host paths end-to-end.
+- Closure sync: querying a host closure root through the guest pulls the
+  whole reference chain into the upper db (`local-overlay-store.cc`).
+- Guest build whose output references host paths — the
+  allowlist-completeness test: any unexpected lower-store demand fails the
+  build loudly.
+- Build dedup: a guest rebuild of a drv the host already has resolves to the
+  lower path without copying anything into the upper layer.
+- Invalid-then-valid: a path queried before the host registers it is visible
+  immediately after — no stale negative in the daemon/proxy/daemon chain.
+- Demand sweep: a battery of innocuous read-only commands; success means
+  local-overlay's lower-store demand stayed within the allowlist.
+- Guest GC: drops unrooted upper paths, leaves lower paths alone.
+- Desync repair: lower files present but unregistered (the README "fchmodat"
+  condition, manufactured directly). The guest's delete-and-re-add reconcile
+  fails with EIO — the lower layer changed under the live overlay mount,
+  which overlayfs treats as undefined — pinned together with the invariants
+  that the lower store stays intact and the daemon survives.
+
+Direct-wire rejection (disallowed op → `STDERR_ERROR` + close) is covered at
+the unit level in `ops`/`session`; e2e exercises rejection only implicitly,
+via builds and the demand sweep.
 
 Unit tests for `wire`/`handshake`/`ops` against byte fixtures; optionally a
 recorded real session (via nix-wire's `record`) replayed against the parser.
