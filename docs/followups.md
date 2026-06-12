@@ -1,0 +1,33 @@
+# Followups
+
+## Recursive nix store overlays
+
+Nested claudepods can mount one overlay on top of an existing overlay, but the
+kernel filesystem stack depth limit stops the naive approach after one nested
+container. True recursive nesting needs a flattened `lowerdir=` stack: each
+child gets the parent's writable upper layer plus all inherited lower layers as
+separate read-only bind mounts, then mounts its own tmpfs upper over that list.
+
+This is O(depth) bind mounts / podman args and needs an explicit layer-stack
+protocol between `claudepod-start` and `claudepod-init`; short mount paths matter
+because the final `lowerdir=` string is finite.
+
+## 1:1 project path mapping after systemd removal
+
+Revisit host-to-guest project paths once the guest no longer boots through
+systemd. The clean shape is to have podman mount the selected host root at a
+static staging path, then have the entry process bind-mount it into the same
+absolute path used on the host, refusing reserved or conflicting targets. This
+should be simpler when the same process can set up mounts and directly launch
+the requested shell/agent.
+
+## Rename `claudepod-init` to `claudepod-entry`
+
+The Rust entrypoint replaced the old `entrypoint.nix` script but is named
+`claudepod-init`, which is misleading while it is mostly container entrypoint
+plumbing rather than a real init system. Rename the binary to
+`claudepod-entry` and update the image `Entrypoint`.
+
+## Reformat anyhow context
+
+Unnecessary verbosity like "failed to" prefixes

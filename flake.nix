@@ -47,12 +47,8 @@
         tag = "latest";
         contents = [];
         includeStorePaths = false;
-        config.Entrypoint = [
-          "${import ./entrypoint.nix {
-            inherit pkgs;
-            toplevel = guest.config.system.build.toplevel;
-          }}"
-        ];
+        config.Entrypoint = ["${rust}/bin/claudepod-init"];
+        config.Env = ["CLAUDEPOD_TOPLEVEL=${guest.config.system.build.toplevel}"];
       };
     in
       pkgs.runCommand "claudepod" {
@@ -101,6 +97,7 @@
       CLAUDEPOD_USERNAME = defaultUsername;
       CLAUDEPOD_IMAGE = "${claudepod.image}";
       CLAUDEPOD_PODMAN = "${pkgs.podman}/bin/podman";
+      RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
 
       packages = [
         pkgs.cargo
