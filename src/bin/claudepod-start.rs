@@ -37,7 +37,7 @@ fn main() -> Result<()> {
 
     let command_name = command_name();
     let username = std::env::var("CLAUDEPOD_USERNAME").context("CLAUDEPOD_USERNAME is not set")?;
-    let image = std::env::var("CLAUDEPOD_IMAGE").context("CLAUDEPOD_IMAGE is not set")?;
+    let toplevel = std::env::var("CLAUDEPOD_TOPLEVEL").context("CLAUDEPOD_TOPLEVEL is not set")?;
     let podman = std::env::var("CLAUDEPOD_PODMAN").context("CLAUDEPOD_PODMAN is not set")?;
 
     let mode = if args.shell {
@@ -50,12 +50,23 @@ fn main() -> Result<()> {
     let home_dir = state_dir.join("home");
     std::fs::create_dir_all(&home_dir)
         .with_context(|| format!("failed to create {}", home_dir.display()))?;
+    // Lowerdir for `podman run --rootfs ...:O`; all writes go to podman's
+    // temporary overlay upperdir, so this must remain empty.
+    let rootfs_dir = state_dir.join("empty-rootfs");
+    std::fs::create_dir_all(&rootfs_dir)
+        .with_context(|| format!("failed to create {}", rootfs_dir.display()))?;
+    if rootfs_dir
+        .read_dir()
+        .with_context(|| format!("failed to read {}", rootfs_dir.display()))?
+        .next()
+        .is_some()
+    {
+        bail!("{} is not empty", rootfs_dir.display());
+    }
 
     let src_root = src_root()?;
     let project_dir = std::env::current_dir().context("failed to get current directory")?;
     let (guest_path, need_project_share) = guest_project_path(&project_dir, &src_root, &username)?;
-
-    load_image(&image, &podman)?;
 
     let proxy_socket = spawn_nix_proxy()?;
 
@@ -99,6 +110,10 @@ fn main() -> Result<()> {
     println!("  Guest path: {guest_path}");
     println!();
 
+    let init = std::env::current_exe()
+        .context("failed to resolve own executable path")?
+        .with_file_name("claudepod-init");
+
     let mut command = Command::new(&podman);
     command.args([
         "run",
@@ -113,6 +128,7 @@ fn main() -> Result<()> {
         "--cap-add=SYS_PTRACE",
         "--device",
         "/dev/fuse",
+        "--rootfs",
         "--systemd=always",
         "--no-hostname",
         "--no-hosts",
@@ -132,10 +148,13 @@ fn main() -> Result<()> {
     }
     command
         .arg("-e")
+        .arg(format!("CLAUDEPOD_TOPLEVEL={toplevel}"))
+        .arg("-e")
         .arg(format!("CLAUDEPOD_PROJECT_PATH={guest_path}"))
         .arg("-e")
         .arg(format!("CLAUDEPOD_MODE={mode}"))
-        .arg("claudepod:latest")
+        .arg(format!("{}:O", rootfs_dir.display()))
+        .arg(init)
         .args(args.command);
 
     Err(command.exec()).context("failed to exec podman")
@@ -263,42 +282,4 @@ fn guest_project_path(
         .ok_or_else(|| anyhow!("failed to determine project directory name"))?
         .to_string_lossy();
     Ok((format!("/projects/{project_name}"), true))
-}
-
-fn load_image(image: &str, podman: &str) -> Result<()> {
-    let mut image_stream = Command::new(image)
-        .stdout(Stdio::piped())
-        .spawn()
-        .with_context(|| format!("failed to start image stream {image}"))?;
-    let image_stdout = image_stream
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow!("failed to capture image stream stdout"))?;
-
-    let podman_load = Command::new(podman)
-        .args(["load", "-q"])
-        .stdin(Stdio::from(image_stdout))
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| format!("failed to start {podman} load"))?;
-
-    let podman_output = podman_load
-        .wait_with_output()
-        .context("failed to wait for podman load")?;
-    let image_status = image_stream
-        .wait()
-        .context("failed to wait for image stream")?;
-
-    if !podman_output.status.success() {
-        bail!(
-            "podman load failed with {}:\n{}",
-            podman_output.status,
-            String::from_utf8_lossy(&podman_output.stderr).trim_end()
-        );
-    }
-    if !image_status.success() {
-        bail!("image stream failed with {image_status}");
-    }
-
-    Ok(())
 }

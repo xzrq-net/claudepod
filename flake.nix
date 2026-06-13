@@ -42,24 +42,17 @@
       };
       craneLib = crane.mkLib pkgs;
       rust = craneLib.buildPackage {src = craneLib.cleanCargoSource ./.;};
-      image = pkgs.dockerTools.streamLayeredImage {
-        name = "claudepod";
-        tag = "latest";
-        contents = [];
-        includeStorePaths = false;
-        config.Entrypoint = ["${rust}/bin/claudepod-init"];
-        config.Env = ["CLAUDEPOD_TOPLEVEL=${guest.config.system.build.toplevel}"];
-      };
+      toplevel = guest.config.system.build.toplevel;
     in
       pkgs.runCommand "claudepod" {
         nativeBuildInputs = [pkgs.makeWrapper];
-        passthru = {inherit rust image;};
+        passthru = {inherit rust toplevel;};
       } ''
         mkdir -p $out/bin
         makeWrapper ${rust}/bin/claudepod-start $out/bin/claudepod \
           --inherit-argv0 \
           --set CLAUDEPOD_USERNAME ${pkgs.lib.escapeShellArg username} \
-          --set CLAUDEPOD_IMAGE ${image} \
+          --set CLAUDEPOD_TOPLEVEL ${toplevel} \
           --set CLAUDEPOD_PODMAN ${pkgs.podman}/bin/podman
         ln -s claudepod $out/bin/gptpod
       '';
@@ -95,7 +88,7 @@
 
     devShells.x86_64-linux.default = pkgs.mkShell {
       CLAUDEPOD_USERNAME = defaultUsername;
-      CLAUDEPOD_IMAGE = "${claudepod.image}";
+      CLAUDEPOD_TOPLEVEL = "${claudepod.toplevel}";
       CLAUDEPOD_PODMAN = "${pkgs.podman}/bin/podman";
       RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
 

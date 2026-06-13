@@ -14,9 +14,12 @@ ambient credentials like dotfiles. Isolation model:
 - GPT 5.5 couldn't figure out a way to escape isolation
 - host Nix store is fully readable (you don't keep secrets in there, do you?)
 
-The container itself is a few hundred kilobytes. It mounts the host Nix store
-read-only and uses the Nix daemon's local-overlay feature, consulting the host
-daemon for metadata through a read-only proxy.
+The container runs from an empty rootfs overlay: podman just manages the
+container's scratch layer. At runtime, `claudepod-start` passes
+`claudepod-init` and the NixOS toplevel from the host store; the init sets up
+the store overlay and hands off to NixOS/systemd. The guest mounts the host
+Nix store read-only and uses the Nix daemon's local-overlay feature,
+consulting the host daemon for metadata through a read-only proxy.
 
 ## Quick Start
 
