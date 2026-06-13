@@ -9,13 +9,6 @@ in {
   options.programs.claudepod = {
     enable = lib.mkEnableOption "claudepod";
 
-    username = lib.mkOption {
-      type = lib.types.str;
-      default = config.home.username;
-      defaultText = "config.home.username";
-      description = "User name to create inside the claudepod guest.";
-    };
-
     guestSystem = lib.mkOption {
       type = lib.types.str;
       default = pkgs.stdenv.hostPlatform.system;
@@ -37,7 +30,7 @@ in {
     home.packages = [
       (mkClaudepod {
         inherit pkgs;
-        inherit (cfg) username guestSystem extraGuestPackages;
+        inherit (cfg) guestSystem extraGuestPackages;
       })
     ];
   };

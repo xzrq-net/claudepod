@@ -25,11 +25,8 @@
 
     guestModule = import ./guest-module.nix {inherit nix-index-database;};
 
-    defaultUsername = "user";
-
     mkClaudepod = {
       pkgs,
-      username,
       guestSystem ? pkgs.stdenv.hostPlatform.system,
       extraGuestPackages ? (_: []),
     }: let
@@ -37,7 +34,7 @@
         system = guestSystem;
         modules = [
           guestModule
-          {claudepod = {inherit username extraGuestPackages;};}
+          {claudepod = {inherit extraGuestPackages;};}
         ];
       };
       craneLib = crane.mkLib pkgs;
@@ -51,16 +48,12 @@
         mkdir -p $out/bin
         makeWrapper ${rust}/bin/claudepod-start $out/bin/claudepod \
           --inherit-argv0 \
-          --set CLAUDEPOD_USERNAME ${pkgs.lib.escapeShellArg username} \
           --set CLAUDEPOD_TOPLEVEL ${toplevel} \
           --set CLAUDEPOD_PODMAN ${pkgs.podman}/bin/podman
         ln -s claudepod $out/bin/gptpod
       '';
 
-    claudepod = mkClaudepod {
-      inherit pkgs;
-      username = defaultUsername;
-    };
+    claudepod = mkClaudepod {inherit pkgs;};
   in {
     nixosModules.default = guestModule;
     homeModules.default = import ./home-manager-module.nix {inherit mkClaudepod;};
@@ -87,7 +80,6 @@
     };
 
     devShells.x86_64-linux.default = pkgs.mkShell {
-      CLAUDEPOD_USERNAME = defaultUsername;
       CLAUDEPOD_TOPLEVEL = "${claudepod.toplevel}";
       CLAUDEPOD_PODMAN = "${pkgs.podman}/bin/podman";
       RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";

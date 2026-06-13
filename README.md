@@ -17,9 +17,11 @@ ambient credentials like dotfiles. Isolation model:
 The container runs from an empty rootfs overlay: podman just manages the
 container's scratch layer. At runtime, `claudepod-start` passes
 `claudepod-init` and the NixOS toplevel from the host store; the init sets up
-the store overlay and hands off to NixOS/systemd. The guest mounts the host
-Nix store read-only and uses the Nix daemon's local-overlay feature,
-consulting the host daemon for metadata through a read-only proxy.
+the store overlay, writes runtime config, and hands off to NixOS/systemd.
+Before the shell starts, systemd creates the guest user from that config (host
+username, uid 1000). The guest mounts the host Nix store read-only and uses the
+Nix daemon's local-overlay feature, consulting the host daemon for metadata
+through a read-only proxy.
 
 ## Quick Start
 
@@ -80,7 +82,6 @@ Example:
         {
           programs.claudepod = {
             enable = true;
-            username = "me"; # username in container, defaults to Home Manager username
 
             # function from guest `pkgs` to extra packages installed in the guest
             extraGuestPackages = pkgs: [

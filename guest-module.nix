@@ -42,17 +42,41 @@
         ;;
     esac
   '';
+
+  claudepodRuntimeUser = pkgs.writeShellScript "claudepod-runtime-user" ''
+    set -eu
+
+    IFS= read -r username < /run/claudepod-username
+    home=/home/$username
+
+    shutdown() {
+      status=$1
+      ${pkgs.util-linux}/bin/kill -SIGRTMIN+14 1 || true
+      exit "$status"
+    }
+
+    ${pkgs.shadow}/bin/useradd \
+      --no-create-home \
+      --no-user-group \
+      --uid 1000 \
+      --gid 100 \
+      --groups wheel \
+      --home-dir "$home" \
+      --shell /run/current-system/sw/bin/bash \
+      -- \
+      "$username" \
+      || shutdown $?
+
+    ${pkgs.coreutils}/bin/rm -f /etc/subuid /etc/subgid || shutdown $?
+    ${pkgs.coreutils}/bin/install -m 0644 -o root -g root /run/claudepod-subuid /etc/subuid || shutdown $?
+    ${pkgs.coreutils}/bin/install -m 0644 -o root -g root /run/claudepod-subgid /etc/subgid || shutdown $?
+  '';
 in {
   imports = [
     nix-index-database.nixosModules.nix-index
   ];
 
   options.claudepod = {
-    username = lib.mkOption {
-      type = lib.types.str;
-      description = "Normal user created inside the claudepod guest.";
-    };
-
     extraGuestPackages = lib.mkOption {
       type = lib.types.functionTo (lib.types.listOf lib.types.package);
       default = _guestPkgs: [];
@@ -71,29 +95,35 @@ in {
 
     users.groups.users.gid = 100;
 
-    users.users.${cfg.username} = {
-      isNormalUser = true;
-      home = "/home/${cfg.username}";
-      group = "users";
-      extraGroups = ["wheel"];
-      initialHashedPassword = "";
-      uid = 1000;
-    };
-
     security.sudo.wheelNeedsPassword = false;
+
+    virtualisation.podman.enable = true;
+
+    systemd.services.claudepod-runtime-user = {
+      description = "Create claudepod runtime user";
+      before = ["claudepod-shell.service"];
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+        ExecStart = "${claudepodRuntimeUser}";
+      };
+    };
 
     systemd.services.claudepod-shell = {
       description = "Claudepod interactive shell";
-      after = ["multi-user.target"];
+      requires = ["claudepod-runtime-user.service"];
+      after = ["multi-user.target" "claudepod-runtime-user.service"];
       wantedBy = ["multi-user.target"];
       serviceConfig = {
         Type = "simple";
+        User = "1000";
+        Group = "100";
+        Environment = "XDG_RUNTIME_DIR=/run/user/1000";
         StandardInput = "tty";
         StandardOutput = "tty";
         TTYPath = "/dev/console";
         TTYReset = true;
         TTYVHangup = true;
-        User = cfg.username;
         ExecStart = "${claudepodStart}";
         ExecStopPost = "+" + "${pkgs.util-linux}/bin/kill -SIGRTMIN+14 1";
       };
@@ -165,7 +195,10 @@ in {
     # creates the mountpoint parent 0755, which would let any guest uid
     # connect. The socket itself must stay 0666 for host-side uid-mapping
     # reasons (see spawn_nix_proxy in claudepod-start.rs).
-    systemd.tmpfiles.rules = ["z /nix/.host-nix-daemon 0700 root root - -"];
+    systemd.tmpfiles.rules = [
+      "z /nix/.host-nix-daemon 0700 root root - -"
+      "d /run/user/1000 0700 1000 100 - -"
+    ];
 
     # check-mount=false: nix overlay store check-mount validation doesn't match kernel overlayfs /proc/mounts format
     # lower-store: host-side nix proxy socket, bind-mounted in by claudepod-start (see docs/nix-proxy.md)

@@ -9,25 +9,31 @@ child gets the parent's writable upper layer plus all inherited lower layers as
 separate read-only bind mounts, then mounts its own tmpfs upper over that list.
 
 This is O(depth) bind mounts / podman args and needs an explicit layer-stack
-protocol between `claudepod-start` and `claudepod-init`; short mount paths matter
-because the final `lowerdir=` string is finite.
+protocol between `claudepod-start` and `claudepod-init`; short mount paths
+matter because the final `lowerdir=` string is finite.
 
-## 1:1 project path mapping after systemd removal
+## 1:1 project path mapping
 
-Revisit host-to-guest project paths once the guest no longer boots through
-systemd. The clean shape is to have podman mount the selected host root at a
-static staging path, then have the entry process bind-mount it into the same
-absolute path used on the host, refusing reserved or conflicting targets. This
-should be simpler when the same process can set up mounts and directly launch
-the requested shell/agent.
+Revisit host-to-guest project paths. The clean shape is to have podman mount the
+selected host root at a static staging path, then have the entry process
+bind-mount it into the same absolute path used on the host, refusing reserved or
+conflicting targets.
 
 ## Rename `claudepod-init` to `claudepod-entry`
 
 The Rust entrypoint replaced the old `entrypoint.nix` script but is named
 `claudepod-init`, which is misleading while it is mostly container entrypoint
-plumbing rather than a real init system. Rename the binary to
-`claudepod-entry` and update the image `Entrypoint`.
+plumbing rather than a real init system. Rename the binary to `claudepod-entry`
+and update the image `Entrypoint`.
 
-## Reformat anyhow context
+## Reformat anyhow context / fix import
 
 Unnecessary verbosity like "failed to" prefixes
+
+## OsString vs String audit for paths / env vars / platform bits
+
+## guest module: rename claudepodStart to disambiguate. shell maybe
+
+## Trim systemd units for boot
+
+## Audit anyhow:: fq name

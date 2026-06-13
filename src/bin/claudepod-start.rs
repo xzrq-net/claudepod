@@ -36,9 +36,10 @@ fn main() -> Result<()> {
     let args = Args::parse();
 
     let command_name = command_name();
-    let username = std::env::var("CLAUDEPOD_USERNAME").context("CLAUDEPOD_USERNAME is not set")?;
     let toplevel = std::env::var("CLAUDEPOD_TOPLEVEL").context("CLAUDEPOD_TOPLEVEL is not set")?;
     let podman = std::env::var("CLAUDEPOD_PODMAN").context("CLAUDEPOD_PODMAN is not set")?;
+    let username = username()?;
+    let home = format!("/home/{username}");
 
     let mode = if args.shell {
         "shell"
@@ -76,8 +77,8 @@ fn main() -> Result<()> {
             "{}:/nix/.host-nix-daemon/socket",
             proxy_socket.display()
         )),
-        OsString::from(format!("{}:/home/{username}", home_dir.display())),
-        OsString::from(format!("{}:/home/{username}/src", src_root.display())),
+        OsString::from(format!("{}:{home}", home_dir.display())),
+        OsString::from(format!("{}:{home}/src", src_root.display())),
     ];
     if need_project_share {
         volumes.push(OsString::from(format!(
@@ -148,6 +149,8 @@ fn main() -> Result<()> {
     }
     command
         .arg("-e")
+        .arg(format!("CLAUDEPOD_USERNAME={username}"))
+        .arg("-e")
         .arg(format!("CLAUDEPOD_TOPLEVEL={toplevel}"))
         .arg("-e")
         .arg(format!("CLAUDEPOD_PROJECT_PATH={guest_path}"))
@@ -158,6 +161,15 @@ fn main() -> Result<()> {
         .args(args.command);
 
     Err(command.exec()).context("failed to exec podman")
+}
+
+/// Username for the guest passwd entry, from the host user database.
+fn username() -> Result<String> {
+    let user =
+        nix::unistd::User::from_uid(nix::unistd::Uid::current()).context("look up current user")?;
+    Ok(user
+        .ok_or_else(|| anyhow!("current uid has no passwd entry"))?
+        .name)
 }
 
 /// Start the nix proxy (see docs/nix-proxy.md) and return the host path of
