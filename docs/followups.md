@@ -29,6 +29,4 @@ Unnecessary verbosity like "failed to" prefixes
 
 ## guest module: rename claudepodStart to disambiguate from claudepod-start.rs. maybe claudepodShell
 
-## Trim systemd units for boot
-
 ## Audit anyhow:: fully qualified names in rust code
