@@ -45,7 +45,7 @@ async fn reexec_under_unshare() -> Result<()> {
         .env(REEXEC_GUARD, "1")
         .status()
         .await
-        .context("failed to re-exec under unshare")?;
+        .context("re-exec under unshare")?;
     std::process::exit(status.code().unwrap_or(1));
 }
 
@@ -75,7 +75,7 @@ macro_rules! run_tests {
     ($fixture:expr, $($test:ident),* $(,)?) => {
         $(
             step(concat!("test: ", stringify!($test)));
-            $fixture.$test().await.context(concat!("test failed: ", stringify!($test)))?;
+            $fixture.$test().await.context(concat!("test: ", stringify!($test)))?;
         )*
     };
 }
@@ -600,7 +600,7 @@ impl Env {
 
     async fn spawn_daemon(&self, mut cmd: Command, socket: &Path) -> Result<Child> {
         eprintln!("+ {}", fmt_cmd(&cmd));
-        let mut child = cmd.spawn().context("failed to spawn nix-daemon")?;
+        let mut child = cmd.spawn().context("spawn nix-daemon")?;
 
         let ready = async {
             while !socket.exists() {
@@ -625,7 +625,7 @@ async fn run_cmd_fail(cmd: &mut Command) -> Result<String> {
     let out = cmd
         .output()
         .await
-        .with_context(|| format!("failed to run {display}"))?;
+        .with_context(|| format!("run {display}"))?;
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     eprint!("{stderr}");
     ensure!(
@@ -641,7 +641,7 @@ async fn run_cmd(cmd: &mut Command) -> Result<String> {
     let out = cmd
         .output()
         .await
-        .with_context(|| format!("failed to run {display}"))?;
+        .with_context(|| format!("run {display}"))?;
     eprint!("{}", String::from_utf8_lossy(&out.stderr));
     ensure!(out.status.success(), "command failed with {}", out.status);
     Ok(String::from_utf8(out.stdout)?)

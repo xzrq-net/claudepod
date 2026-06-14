@@ -58,11 +58,10 @@ async fn run(args: Args, listener: StdUnixListener, socket_path: Option<PathBuf>
     // Handlers go in before PR_SET_PDEATHSIG: a parent death at any later
     // point lands here (and unlinks the socket) instead of hitting the
     // default disposition mid-startup.
-    let mut sigterm =
-        signal(SignalKind::terminate()).context("failed to install SIGTERM handler")?;
-    let mut sigint = signal(SignalKind::interrupt()).context("failed to install SIGINT handler")?;
+    let mut sigterm = signal(SignalKind::terminate()).context("install SIGTERM handler")?;
+    let mut sigint = signal(SignalKind::interrupt()).context("install SIGINT handler")?;
 
-    nix::sys::prctl::set_pdeathsig(Signal::SIGTERM).context("PR_SET_PDEATHSIG failed")?;
+    nix::sys::prctl::set_pdeathsig(Signal::SIGTERM).context("PR_SET_PDEATHSIG")?;
     // The parent may have died between spawning us and the prctl above, in
     // which case the signal will never fire.
     if nix::unistd::getppid().as_raw() != args.parent_pid {
@@ -71,8 +70,8 @@ async fn run(args: Args, listener: StdUnixListener, socket_path: Option<PathBuf>
 
     listener
         .set_nonblocking(true)
-        .context("failed to set listener nonblocking")?;
-    let listener = UnixListener::from_std(listener).context("failed to adopt listener fd")?;
+        .context("set listener nonblocking")?;
+    let listener = UnixListener::from_std(listener).context("adopt listener fd")?;
 
     let on_first_accept =
         socket_path.map(|path| Box::new(move || unlink(&path)) as Box<dyn FnOnce() + Send>);
@@ -90,9 +89,6 @@ fn unlink(path: &Path) {
     if let Err(err) = std::fs::remove_file(path)
         && err.kind() != std::io::ErrorKind::NotFound
     {
-        eprintln!(
-            "claudepod-nix-proxy: failed to unlink {}: {err}",
-            path.display()
-        );
+        eprintln!("claudepod-nix-proxy: unlink {}: {err}", path.display());
     }
 }

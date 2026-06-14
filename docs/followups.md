@@ -19,10 +19,4 @@ selected host root at a static staging path, then have the entry process
 bind-mount it into the same absolute path used on the host, refusing reserved or
 conflicting targets.
 
-## Reformat anyhow context / fix import
-
-Unnecessary verbosity like "failed to" prefixes
-
 ## OsString vs String audit for paths / env vars / platform bits
-
-## Audit anyhow:: fully qualified names in rust code

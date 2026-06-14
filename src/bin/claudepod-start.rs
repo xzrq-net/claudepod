@@ -51,16 +51,15 @@ fn main() -> Result<()> {
 
     let state_dir = state_dir()?;
     let home_dir = state_dir.join("home");
-    std::fs::create_dir_all(&home_dir)
-        .with_context(|| format!("failed to create {}", home_dir.display()))?;
+    std::fs::create_dir_all(&home_dir).with_context(|| format!("create {}", home_dir.display()))?;
     // Lowerdir for `podman run --rootfs ...:O`; all writes go to podman's
     // temporary overlay upperdir, so this must remain empty.
     let rootfs_dir = state_dir.join("empty-rootfs");
     std::fs::create_dir_all(&rootfs_dir)
-        .with_context(|| format!("failed to create {}", rootfs_dir.display()))?;
+        .with_context(|| format!("create {}", rootfs_dir.display()))?;
     if rootfs_dir
         .read_dir()
-        .with_context(|| format!("failed to read {}", rootfs_dir.display()))?
+        .with_context(|| format!("read {}", rootfs_dir.display()))?
         .next()
         .is_some()
     {
@@ -68,7 +67,7 @@ fn main() -> Result<()> {
     }
 
     let src_root = src_root()?;
-    let project_dir = std::env::current_dir().context("failed to get current directory")?;
+    let project_dir = std::env::current_dir().context("current directory")?;
     let (guest_path, need_project_share) = guest_project_path(&project_dir, &src_root, &username)?;
 
     let proxy_socket = spawn_nix_proxy()?;
@@ -114,7 +113,7 @@ fn main() -> Result<()> {
     println!();
 
     let init = std::env::current_exe()
-        .context("failed to resolve own executable path")?
+        .context("resolve own executable path")?
         .with_file_name("claudepod-entry");
 
     let mut command = Command::new(&podman);
@@ -170,7 +169,7 @@ fn main() -> Result<()> {
         .arg(init)
         .args(args.command);
 
-    Err(command.exec()).context("failed to exec podman")
+    Err(command.exec()).context("exec podman")
 }
 
 /// Username for the guest passwd entry, from the host user database.
@@ -203,27 +202,26 @@ fn spawn_nix_proxy() -> Result<PathBuf> {
         Ok(()) => {}
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
         Err(err) => {
-            return Err(err)
-                .with_context(|| format!("failed to remove stale {}", socket_path.display()));
+            return Err(err).with_context(|| format!("remove stale {}", socket_path.display()));
         }
     }
     let listener = UnixListener::bind(&socket_path)
-        .with_context(|| format!("failed to listen on {}", socket_path.display()))?;
+        .with_context(|| format!("listen on {}", socket_path.display()))?;
     // The guest nix-daemon connects as container root, which keep-id maps
     // to a host subuid — not the socket's owner — and connect() needs write
     // permission on the inode. The 0700 runtime dir still gates host-side
     // access.
     std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o666))
-        .with_context(|| format!("failed to chmod {}", socket_path.display()))?;
+        .with_context(|| format!("chmod {}", socket_path.display()))?;
 
     // Strip CLOEXEC so the proxy child inherits the listener at the same fd
     // number. Single-threaded, and the listener drops right after spawn, so
     // the cleared flag never leaks into the later exec of podman.
     fcntl(&listener, FcntlArg::F_SETFD(FdFlag::empty()))
-        .context("failed to clear CLOEXEC on proxy listener")?;
+        .context("clear CLOEXEC on proxy listener")?;
 
     let proxy_bin = std::env::current_exe()
-        .context("failed to resolve own executable path")?
+        .context("resolve own executable path")?
         .with_file_name("claudepod-nix-proxy");
     Command::new(&proxy_bin)
         .arg("--listen-fd")
@@ -232,7 +230,7 @@ fn spawn_nix_proxy() -> Result<PathBuf> {
         .arg(std::process::id().to_string())
         .stdin(Stdio::null())
         .spawn()
-        .with_context(|| format!("failed to spawn {}", proxy_bin.display()))?;
+        .with_context(|| format!("spawn {}", proxy_bin.display()))?;
 
     Ok(socket_path)
 }
@@ -253,7 +251,7 @@ fn proxy_socket_path() -> Result<PathBuf> {
         .recursive(true)
         .mode(0o700)
         .create(&run_dir)
-        .with_context(|| format!("failed to create {}", run_dir.display()))?;
+        .with_context(|| format!("create {}", run_dir.display()))?;
     Ok(run_dir.join(name))
 }
 
@@ -301,7 +299,7 @@ fn guest_project_path(
 
     let project_name = project_dir
         .file_name()
-        .ok_or_else(|| anyhow!("failed to determine project directory name"))?
+        .ok_or_else(|| anyhow!("project directory has no file name"))?
         .to_string_lossy();
     Ok((format!("/projects/{project_name}"), true))
 }

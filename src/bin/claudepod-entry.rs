@@ -35,7 +35,7 @@ fn run() -> Result<()> {
     let username = std::env::var("CLAUDEPOD_USERNAME").context("CLAUDEPOD_USERNAME is not set")?;
     let command: Vec<OsString> = std::env::args_os().skip(1).collect();
 
-    setup_store_overlay().context("mount setup failed")?;
+    setup_store_overlay().context("mount setup")?;
     write_runtime_config(&username, &command).context("write runtime config")?;
 
     let mut init = Command::new(toplevel);
@@ -44,7 +44,7 @@ fn run() -> Result<()> {
     if std::env::var_os("container").is_none() {
         init.env("container", "podman");
     }
-    Err(init.exec()).context("failed to exec NixOS init")
+    Err(init.exec()).context("exec NixOS init")
 }
 
 /// Writable overlay for /nix/store: the read-only host store bind-mounted
