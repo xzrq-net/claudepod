@@ -81,7 +81,15 @@ in {
     system.stateVersion = lib.trivial.release;
 
     boot.isNspawnContainer = true;
+    # Boot only the session target claudepod needs, while keeping basic/logind
+    # for sockets, tmpfiles/wrappers, nix-daemon, and the pam_systemd session.
+    systemd.defaultUnit = "claudepod.target";
     systemd.settings.Manager.ShowStatus = "no";
+    # The rootfs is ephemeral; committing transient machine-id writes overlay
+    # data for no persistent benefit and can delay shutdown.
+    systemd.suppressedSystemUnits = [
+      "systemd-machine-id-commit.service"
+    ];
     networking.hostName = "claudepod";
 
     systemd.services.console-getty.enable = false;
@@ -113,8 +121,8 @@ in {
     systemd.services.claudepod-shell = {
       description = "Claudepod interactive shell";
       requires = ["claudepod-runtime-user.service"];
-      after = ["multi-user.target" "claudepod-runtime-user.service"];
-      wantedBy = ["multi-user.target"];
+      after = ["basic.target" "systemd-logind.service" "claudepod-runtime-user.service"];
+      wantedBy = ["claudepod.target"];
       unitConfig = {
         SuccessAction = "poweroff";
         FailureAction = "poweroff";
@@ -132,6 +140,13 @@ in {
         TTYVHangup = true;
         ExecStart = "${claudepodStart}";
       };
+    };
+
+    systemd.targets.claudepod = {
+      description = "Claudepod session";
+      requires = ["basic.target" "systemd-logind.service"];
+      after = ["basic.target" "systemd-logind.service"];
+      unitConfig.AllowIsolate = true;
     };
 
     environment.systemPackages =
