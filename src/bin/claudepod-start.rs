@@ -38,6 +38,8 @@ fn main() -> Result<()> {
     let command_name = command_name();
     let toplevel = std::env::var("CLAUDEPOD_TOPLEVEL").context("CLAUDEPOD_TOPLEVEL is not set")?;
     let podman = std::env::var("CLAUDEPOD_PODMAN").context("CLAUDEPOD_PODMAN is not set")?;
+    let fuse_overlayfs =
+        std::env::var("CLAUDEPOD_FUSE_OVERLAYFS").context("CLAUDEPOD_FUSE_OVERLAYFS is not set")?;
     let username = username()?;
     let home = format!("/home/{username}");
 
@@ -140,6 +142,12 @@ fn main() -> Result<()> {
         "--security-opt",
         "unmask=ALL",
     ]);
+    // Podman's rootless native overlay teardown can block for seconds at
+    // shutdown. Force the rootfs :O overlay through fuse-overlayfs instead;
+    // hot paths are bind mounts or the guest's tmpfs-backed /nix/store overlay.
+    command
+        .arg("--storage-opt")
+        .arg(format!("overlay.mount_program={fuse_overlayfs}"));
     for volume in volumes {
         command.arg("-v").arg(volume);
     }

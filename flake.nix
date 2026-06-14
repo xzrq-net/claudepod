@@ -40,16 +40,18 @@
       craneLib = crane.mkLib pkgs;
       rust = craneLib.buildPackage {src = craneLib.cleanCargoSource ./.;};
       toplevel = guest.config.system.build.toplevel;
+      fuseOverlayfs = "${pkgs.fuse-overlayfs}/bin/fuse-overlayfs";
     in
       pkgs.runCommand "claudepod" {
         nativeBuildInputs = [pkgs.makeWrapper];
-        passthru = {inherit rust toplevel;};
+        passthru = {inherit rust toplevel fuseOverlayfs;};
       } ''
         mkdir -p $out/bin
         makeWrapper ${rust}/bin/claudepod-start $out/bin/claudepod \
           --inherit-argv0 \
           --set CLAUDEPOD_TOPLEVEL ${toplevel} \
-          --set CLAUDEPOD_PODMAN ${pkgs.podman}/bin/podman
+          --set CLAUDEPOD_PODMAN ${pkgs.podman}/bin/podman \
+          --set CLAUDEPOD_FUSE_OVERLAYFS ${fuseOverlayfs}
         ln -s claudepod $out/bin/gptpod
       '';
 
@@ -82,6 +84,7 @@
     devShells.x86_64-linux.default = pkgs.mkShell {
       CLAUDEPOD_TOPLEVEL = "${claudepod.toplevel}";
       CLAUDEPOD_PODMAN = "${pkgs.podman}/bin/podman";
+      CLAUDEPOD_FUSE_OVERLAYFS = claudepod.fuseOverlayfs;
       RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
 
       packages = [
