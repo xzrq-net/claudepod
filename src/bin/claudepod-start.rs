@@ -129,6 +129,8 @@ fn main() -> Result<()> {
         "--cap-add=SYS_PTRACE",
         "--device",
         "/dev/fuse",
+        "--device",
+        "/dev/net/tun",
         "--rootfs",
         "--systemd=always",
         "--no-hostname",
