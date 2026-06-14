@@ -117,3 +117,10 @@ Broken down:
   `/nix/store` path used by guest processes.
 - `check-mount=false`: skip Nix's overlay-store mount validation because it does
   not match the kernel overlayfs format reported in `/proc/mounts`.
+
+Nested claudepods flatten the store overlay stack instead of mounting an overlay
+on an overlay. `claudepod-start` bind-mounts each inherited layer at short
+`/nix/.l/<n>` paths and passes the list to the child entry via
+`CLAUDEPOD_STORE_LAYERS`; `claudepod-entry` uses it as `lowerdir=` and records
+its own writable upper layer first, in `/run/claudepod-store-layers`, for a
+nested `claudepod-start` to inherit.

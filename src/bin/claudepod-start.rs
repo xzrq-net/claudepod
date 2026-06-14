@@ -9,9 +9,12 @@ use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
+use claudepod::store_layers;
 use nix::fcntl::{FcntlArg, FdFlag, fcntl};
 
 const HOST_DAEMON_SOCKET: &str = "/nix/var/nix/daemon-socket/socket";
+const STORE_LAYERS_FILE: &str = "/run/claudepod-store-layers";
+const STORE_LAYER_MOUNT_DIR: &str = "/nix/.l";
 
 #[derive(Debug, Parser)]
 #[command(disable_version_flag = true, trailing_var_arg = true)]
@@ -69,6 +72,13 @@ fn main() -> Result<()> {
     let src_root = src_root()?;
     let project_dir = std::env::current_dir().context("current directory")?;
     let (guest_path, need_project_share) = guest_project_path(&project_dir, &src_root, &username)?;
+    let parent_layers = parent_store_layers()?;
+    // Each inherited layer is bind-mounted into the child at a short
+    // /nix/.l/<n> path (the child's lowerdir= string is length-bounded) and
+    // referenced there via CLAUDEPOD_STORE_LAYERS.
+    let child_layers: Vec<PathBuf> = (0..parent_layers.len())
+        .map(|idx| PathBuf::from(STORE_LAYER_MOUNT_DIR).join(idx.to_string()))
+        .collect();
 
     let proxy_socket = spawn_nix_proxy()?;
 
@@ -82,6 +92,9 @@ fn main() -> Result<()> {
         volume_spec(&home_dir, Path::new(&home), None),
         volume_spec(&src_root, &Path::new(&home).join("src"), None),
     ];
+    for (host, guest) in parent_layers.iter().zip(&child_layers) {
+        volumes.push(volume_spec(host, guest, Some("ro")));
+    }
     if need_project_share {
         volumes.push(volume_spec(&project_dir, Path::new(&guest_path), None));
     }
@@ -154,6 +167,10 @@ fn main() -> Result<()> {
     if args.verbose {
         command.arg("-e").arg("CLAUDEPOD_VERBOSE=1");
     }
+    command.arg("-e").arg(env_arg(
+        store_layers::STORE_LAYERS_ENV,
+        &store_layers::join(&child_layers),
+    ));
     command
         .arg("-e")
         .arg(format!("CLAUDEPOD_USERNAME={username}"))
@@ -313,6 +330,24 @@ fn env_arg(name: &str, value: &OsStr) -> OsString {
     arg.push("=");
     arg.push(value);
     arg
+}
+
+/// Store layers to hand the child, in priority order (highest first). Inside
+/// a pod the parent's entry recorded its flattened stack in
+/// /run/claudepod-store-layers (see setup_store_overlay in claudepod-entry);
+/// at the top level on the host the file is absent and there is just the host
+/// store.
+fn parent_store_layers() -> Result<Vec<PathBuf>> {
+    let raw = match std::fs::read(STORE_LAYERS_FILE) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(vec![PathBuf::from("/nix/store")]);
+        }
+        Err(err) => return Err(err).with_context(|| format!("read {STORE_LAYERS_FILE}")),
+    };
+    let trimmed = raw.strip_suffix(b"\n").unwrap_or(&raw);
+    store_layers::parse(OsStr::from_bytes(trimmed))
+        .with_context(|| format!("parse {STORE_LAYERS_FILE}"))
 }
 
 fn guest_project_path(

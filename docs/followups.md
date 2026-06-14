@@ -1,17 +1,5 @@
 # Followups
 
-## Recursive nix store overlays
-
-Nested claudepods can mount one overlay on top of an existing overlay, but the
-kernel filesystem stack depth limit stops the naive approach after one nested
-container. True recursive nesting needs a flattened `lowerdir=` stack: each
-child gets the parent's writable upper layer plus all inherited lower layers as
-separate read-only bind mounts, then mounts its own tmpfs upper over that list.
-
-This is O(depth) bind mounts / podman args and needs an explicit layer-stack
-protocol between `claudepod-start` and `claudepod-entry`; short mount paths
-matter because the final `lowerdir=` string is finite.
-
 ## 1:1 project path mapping
 
 Revisit host-to-guest project paths. The clean shape is to have podman mount the

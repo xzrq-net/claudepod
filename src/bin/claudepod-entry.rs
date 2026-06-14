@@ -13,13 +13,16 @@ use std::ffi::{OsStr, OsString};
 use std::fmt::Write as _;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::CommandExt;
+use std::path::PathBuf;
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
+use claudepod::store_layers;
 use nix::mount::{MsFlags, mount};
 
 const RUNTIME_UID: u64 = 1000;
 const SUBID_DELEGATE_START: u64 = RUNTIME_UID + 1;
+const STORE_UPPER_DIR: &str = "/nix/.rw-store/store";
 
 fn main() {
     if let Err(err) = run() {
@@ -35,8 +38,9 @@ fn run() -> Result<()> {
     let username = std::env::var("CLAUDEPOD_USERNAME").context("CLAUDEPOD_USERNAME is not set")?;
     let command: Vec<OsString> = std::env::args_os().skip(1).collect();
 
-    setup_store_overlay().context("mount setup")?;
-    write_runtime_config(&username, &command).context("write runtime config")?;
+    let descendant_store_layers = setup_store_overlay().context("mount setup")?;
+    write_runtime_config(&username, &command, &descendant_store_layers)
+        .context("write runtime config")?;
 
     let mut init = Command::new(toplevel);
     // Podman normally sets this via its built-in default env, but --rootfs
@@ -47,18 +51,20 @@ fn run() -> Result<()> {
     Err(init.exec()).context("exec NixOS init")
 }
 
-/// Writable overlay for /nix/store: the read-only host store bind-mounted
-/// aside, a tmpfs upper layer, and an overlayfs combining them.
-fn setup_store_overlay() -> Result<()> {
-    std::fs::create_dir_all("/nix/.host-store").context("create /nix/.host-store")?;
-    mount(
-        Some("/nix/store"),
-        "/nix/.host-store",
-        None::<&str>,
-        MsFlags::MS_BIND,
-        None::<&str>,
-    )
-    .context("bind-mount /nix/store to /nix/.host-store")?;
+/// Set up the writable /nix/store overlay and return the flattened layer stack
+/// a nested claudepod-start should inherit: this level's writable upper first,
+/// then the lower layers we were given.
+///
+/// The lower layers arrive from claudepod-start via CLAUDEPOD_STORE_LAYERS in
+/// priority order (highest first) — just the host store at the top level, or
+/// the parent's whole flattened stack when nested. The tmpfs upper goes over
+/// them, so this level's upper becomes the top layer descendants see.
+fn setup_store_overlay() -> Result<OsString> {
+    let env = store_layers::STORE_LAYERS_ENV;
+    let raw = std::env::var_os(env)
+        .filter(|value| !value.is_empty())
+        .with_context(|| format!("{env} is not set"))?;
+    let lower_layers = store_layers::parse(&raw).with_context(|| format!("parse {env}"))?;
 
     std::fs::create_dir_all("/nix/.rw-store").context("create /nix/.rw-store")?;
     mount(
@@ -69,25 +75,36 @@ fn setup_store_overlay() -> Result<()> {
         Some("mode=755"),
     )
     .context("mount tmpfs on /nix/.rw-store")?;
-    std::fs::create_dir_all("/nix/.rw-store/store").context("create overlay upper dir")?;
+    std::fs::create_dir_all(STORE_UPPER_DIR).context("create overlay upper dir")?;
     std::fs::create_dir_all("/nix/.rw-store/work").context("create overlay work dir")?;
 
+    let mut overlay_options = OsString::from("lowerdir=");
+    overlay_options.push(store_layers::join(&lower_layers));
+    overlay_options.push(",upperdir=");
+    overlay_options.push(STORE_UPPER_DIR);
+    overlay_options.push(",workdir=/nix/.rw-store/work,userxattr");
     mount(
         Some("overlay"),
         "/nix/store",
         Some("overlay"),
         MsFlags::empty(),
-        Some("lowerdir=/nix/.host-store,upperdir=/nix/.rw-store/store,workdir=/nix/.rw-store/work,userxattr"),
+        Some(overlay_options.as_os_str()),
     )
     .context("mount overlay on /nix/store")?;
 
-    Ok(())
+    let mut descendant_layers = vec![PathBuf::from(STORE_UPPER_DIR)];
+    descendant_layers.extend(lower_layers);
+    Ok(store_layers::join(&descendant_layers))
 }
 
 /// Project path, mode, agent command, and forwarded environment, written
 /// under /run where the claudepod-shell unit picks them up across the
 /// systemd boundary.
-fn write_runtime_config(username: &str, command: &[OsString]) -> Result<()> {
+fn write_runtime_config(
+    username: &str,
+    command: &[OsString],
+    descendant_store_layers: &OsStr,
+) -> Result<()> {
     std::fs::write("/run/claudepod-username", format!("{username}\n"))
         .context("write /run/claudepod-username")?;
 
@@ -116,6 +133,14 @@ fn write_runtime_config(username: &str, command: &[OsString]) -> Result<()> {
         args.push(0);
     }
     std::fs::write("/run/claudepod-command", args).context("write /run/claudepod-command")?;
+
+    // Layer stack for a nested claudepod-start. Internal plumbing, not agent
+    // configuration, so it gets its own file rather than being sourced into
+    // the agent's ambient environment via /run/claudepod-env below.
+    let mut store_layers = descendant_store_layers.as_bytes().to_vec();
+    store_layers.push(b'\n');
+    std::fs::write("/run/claudepod-store-layers", store_layers)
+        .context("write /run/claudepod-store-layers")?;
 
     // The guest service reads this via `set -a; . file; set +a`, so values
     // are bash single-quoted.
