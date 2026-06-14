@@ -6,7 +6,7 @@
 }: let
   cfg = config.claudepod;
 
-  claudepodStart = pkgs.writeShellScript "claudepod-start" ''
+  claudepodShell = pkgs.writeShellScript "claudepod-shell" ''
     set -euo pipefail
 
     MODE=$(${pkgs.coreutils}/bin/cat /run/claudepod-mode)
@@ -138,7 +138,7 @@ in {
         TTYPath = "/dev/console";
         TTYReset = true;
         TTYVHangup = true;
-        ExecStart = "${claudepodStart}";
+        ExecStart = "${claudepodShell}";
       };
     };
 

@@ -9,7 +9,7 @@ child gets the parent's writable upper layer plus all inherited lower layers as
 separate read-only bind mounts, then mounts its own tmpfs upper over that list.
 
 This is O(depth) bind mounts / podman args and needs an explicit layer-stack
-protocol between `claudepod-start` and `claudepod-init`; short mount paths
+protocol between `claudepod-start` and `claudepod-entry`; short mount paths
 matter because the final `lowerdir=` string is finite.
 
 ## 1:1 project path mapping
@@ -19,14 +19,10 @@ selected host root at a static staging path, then have the entry process
 bind-mount it into the same absolute path used on the host, refusing reserved or
 conflicting targets.
 
-## Rename `claudepod-init` to `claudepod-entry`
-
 ## Reformat anyhow context / fix import
 
 Unnecessary verbosity like "failed to" prefixes
 
 ## OsString vs String audit for paths / env vars / platform bits
-
-## guest module: rename claudepodStart to disambiguate from claudepod-start.rs. maybe claudepodShell
 
 ## Audit anyhow:: fully qualified names in rust code

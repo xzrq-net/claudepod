@@ -115,7 +115,7 @@ fn main() -> Result<()> {
 
     let init = std::env::current_exe()
         .context("failed to resolve own executable path")?
-        .with_file_name("claudepod-init");
+        .with_file_name("claudepod-entry");
 
     let mut command = Command::new(&podman);
     command.args([

@@ -23,7 +23,7 @@ const SUBID_DELEGATE_START: u64 = RUNTIME_UID + 1;
 
 fn main() {
     if let Err(err) = run() {
-        eprintln!("claudepod-init: {err:#}");
+        eprintln!("claudepod-entry: {err:#}");
         std::process::exit(1);
     }
 }
