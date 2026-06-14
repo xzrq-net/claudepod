@@ -121,7 +121,7 @@ fn write_runtime_config(username: &str, command: &[OsString]) -> Result<()> {
     // are bash single-quoted.
     let mut env = Vec::new();
     for (name, value) in std::env::vars_os() {
-        if name.to_string_lossy().starts_with("CLAUDE_CODE_")
+        if name.as_bytes().starts_with(b"CLAUDE_CODE_")
             || (name == "MAX_THINKING_TOKENS" && !value.is_empty())
         {
             append_env_line(&mut env, &name, &value);

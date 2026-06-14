@@ -1,5 +1,6 @@
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::os::fd::AsRawFd;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::os::unix::net::UnixListener;
 use std::os::unix::process::CommandExt;
@@ -36,10 +37,9 @@ fn main() -> Result<()> {
     let args = Args::parse();
 
     let command_name = command_name();
-    let toplevel = std::env::var("CLAUDEPOD_TOPLEVEL").context("CLAUDEPOD_TOPLEVEL is not set")?;
-    let podman = std::env::var("CLAUDEPOD_PODMAN").context("CLAUDEPOD_PODMAN is not set")?;
-    let fuse_overlayfs =
-        std::env::var("CLAUDEPOD_FUSE_OVERLAYFS").context("CLAUDEPOD_FUSE_OVERLAYFS is not set")?;
+    let toplevel = required_env_os("CLAUDEPOD_TOPLEVEL")?;
+    let podman = required_env_os("CLAUDEPOD_PODMAN")?;
+    let fuse_overlayfs = required_env_os("CLAUDEPOD_FUSE_OVERLAYFS")?;
     let username = username()?;
     let home = format!("/home/{username}");
 
@@ -73,19 +73,17 @@ fn main() -> Result<()> {
     let proxy_socket = spawn_nix_proxy()?;
 
     let mut volumes = vec![
-        OsString::from("/nix/store:/nix/store:ro"),
-        OsString::from(format!(
-            "{}:/nix/.host-nix-daemon/socket",
-            proxy_socket.display()
-        )),
-        OsString::from(format!("{}:{home}", home_dir.display())),
-        OsString::from(format!("{}:{home}/src", src_root.display())),
+        volume_spec(Path::new("/nix/store"), Path::new("/nix/store"), Some("ro")),
+        volume_spec(
+            &proxy_socket,
+            Path::new("/nix/.host-nix-daemon/socket"),
+            None,
+        ),
+        volume_spec(&home_dir, Path::new(&home), None),
+        volume_spec(&src_root, &Path::new(&home).join("src"), None),
     ];
     if need_project_share {
-        volumes.push(OsString::from(format!(
-            "{}:{guest_path}",
-            project_dir.display()
-        )));
+        volumes.push(volume_spec(&project_dir, Path::new(&guest_path), None));
     }
     for spec in args.extra_volumes {
         if spec.as_encoded_bytes().contains(&b':') {
@@ -100,14 +98,14 @@ fn main() -> Result<()> {
 
     let mut env_names = std::env::vars_os()
         .map(|(name, _value)| name)
-        .filter(|name| name.to_string_lossy().starts_with("CLAUDE_CODE_"))
+        .filter(|name| name.as_bytes().starts_with(b"CLAUDE_CODE_"))
         .collect::<Vec<_>>();
     env_names.sort();
     if std::env::var_os("MAX_THINKING_TOKENS").is_some_and(|value| !value.is_empty()) {
         env_names.push(OsString::from("MAX_THINKING_TOKENS"));
     }
 
-    println!("Starting {command_name}...");
+    println!("Starting {}...", command_name.to_string_lossy());
     println!("  Host path: {}", project_dir.display());
     println!("  Guest path: {guest_path}");
     println!();
@@ -146,7 +144,7 @@ fn main() -> Result<()> {
     // hot paths are bind mounts or the guest's tmpfs-backed /nix/store overlay.
     command
         .arg("--storage-opt")
-        .arg(format!("overlay.mount_program={fuse_overlayfs}"));
+        .arg(env_arg("overlay.mount_program", &fuse_overlayfs));
     for volume in volumes {
         command.arg("-v").arg(volume);
     }
@@ -160,12 +158,12 @@ fn main() -> Result<()> {
         .arg("-e")
         .arg(format!("CLAUDEPOD_USERNAME={username}"))
         .arg("-e")
-        .arg(format!("CLAUDEPOD_TOPLEVEL={toplevel}"))
+        .arg(env_arg("CLAUDEPOD_TOPLEVEL", &toplevel))
         .arg("-e")
         .arg(format!("CLAUDEPOD_PROJECT_PATH={guest_path}"))
         .arg("-e")
         .arg(format!("CLAUDEPOD_MODE={mode}"))
-        .arg(format!("{}:O", rootfs_dir.display()))
+        .arg(rootfs_spec(&rootfs_dir))
         .arg(init)
         .args(args.command);
 
@@ -255,21 +253,31 @@ fn proxy_socket_path() -> Result<PathBuf> {
     Ok(run_dir.join(name))
 }
 
-fn command_name() -> String {
-    let argv0 = std::env::args().next().expect("argv[0] is missing");
+fn command_name() -> OsString {
+    let argv0 = std::env::args_os().next().expect("argv[0] is missing");
     Path::new(&argv0)
         .file_name()
         .expect("argv[0] has no file name")
-        .to_string_lossy()
-        .into_owned()
+        .to_os_string()
 }
 
-fn default_mode_from_command_name(command_name: &str) -> Result<&'static str> {
-    match command_name {
-        "claudepod" => Ok("claude"),
-        "gptpod" => Ok("codex"),
-        other => bail!("unknown command name {other:?}; expected claudepod or gptpod"),
+fn default_mode_from_command_name(command_name: &OsStr) -> Result<&'static str> {
+    if command_name == OsStr::new("claudepod") {
+        Ok("claude")
+    } else if command_name == OsStr::new("gptpod") {
+        Ok("codex")
+    } else {
+        bail!(
+            "unknown command name {:?}; expected claudepod or gptpod",
+            command_name.to_string_lossy()
+        )
     }
+}
+
+fn required_env_os(name: &str) -> Result<OsString> {
+    std::env::var_os(name)
+        .filter(|value| !value.is_empty())
+        .with_context(|| format!("{name} is not set"))
 }
 
 fn state_dir() -> Result<PathBuf> {
@@ -281,6 +289,30 @@ fn state_dir() -> Result<PathBuf> {
 fn src_root() -> Result<PathBuf> {
     let home = std::env::var_os("HOME").ok_or_else(|| anyhow!("HOME is not set"))?;
     Ok(PathBuf::from(home).join("src"))
+}
+
+fn volume_spec(host: &Path, guest: &Path, options: Option<&str>) -> OsString {
+    let mut spec = OsString::from(host.as_os_str());
+    spec.push(":");
+    spec.push(guest.as_os_str());
+    if let Some(options) = options {
+        spec.push(":");
+        spec.push(options);
+    }
+    spec
+}
+
+fn rootfs_spec(rootfs_dir: &Path) -> OsString {
+    let mut spec = OsString::from(rootfs_dir.as_os_str());
+    spec.push(":O");
+    spec
+}
+
+fn env_arg(name: &str, value: &OsStr) -> OsString {
+    let mut arg = OsString::from(name);
+    arg.push("=");
+    arg.push(value);
+    arg
 }
 
 fn guest_project_path(
@@ -302,4 +334,23 @@ fn guest_project_path(
         .ok_or_else(|| anyhow!("project directory has no file name"))?
         .to_string_lossy();
     Ok((format!("/projects/{project_name}"), true))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::volume_spec;
+    use std::ffi::OsStr;
+    use std::path::Path;
+
+    #[test]
+    fn volume_specs_preserve_os_path_components() {
+        assert_eq!(
+            volume_spec(
+                Path::new("/host path"),
+                Path::new("/guest path"),
+                Some("ro")
+            ),
+            OsStr::new("/host path:/guest path:ro")
+        );
+    }
 }
