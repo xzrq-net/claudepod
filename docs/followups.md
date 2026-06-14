@@ -21,19 +21,14 @@ conflicting targets.
 
 ## Rename `claudepod-init` to `claudepod-entry`
 
-The Rust entrypoint replaced the old `entrypoint.nix` script but is named
-`claudepod-init`, which is misleading while it is mostly container entrypoint
-plumbing rather than a real init system. Rename the binary to `claudepod-entry`
-and update the image `Entrypoint`.
-
 ## Reformat anyhow context / fix import
 
 Unnecessary verbosity like "failed to" prefixes
 
 ## OsString vs String audit for paths / env vars / platform bits
 
-## guest module: rename claudepodStart to disambiguate. shell maybe
+## guest module: rename claudepodStart to disambiguate from claudepod-start.rs. maybe claudepodShell
 
 ## Trim systemd units for boot
 
-## Audit anyhow:: fq name
+## Audit anyhow:: fully qualified names in rust code

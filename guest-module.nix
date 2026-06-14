@@ -49,12 +49,6 @@
     IFS= read -r username < /run/claudepod-username
     home=/home/$username
 
-    shutdown() {
-      status=$1
-      ${pkgs.util-linux}/bin/kill -SIGRTMIN+14 1 || true
-      exit "$status"
-    }
-
     ${pkgs.shadow}/bin/useradd \
       --no-create-home \
       --no-user-group \
@@ -64,12 +58,11 @@
       --home-dir "$home" \
       --shell /run/current-system/sw/bin/bash \
       -- \
-      "$username" \
-      || shutdown $?
+      "$username"
 
-    ${pkgs.coreutils}/bin/rm -f /etc/subuid /etc/subgid || shutdown $?
-    ${pkgs.coreutils}/bin/install -m 0644 -o root -g root /run/claudepod-subuid /etc/subuid || shutdown $?
-    ${pkgs.coreutils}/bin/install -m 0644 -o root -g root /run/claudepod-subgid /etc/subgid || shutdown $?
+    ${pkgs.coreutils}/bin/rm -f /etc/subuid /etc/subgid
+    ${pkgs.coreutils}/bin/install -m 0644 -o root -g root /run/claudepod-subuid /etc/subuid
+    ${pkgs.coreutils}/bin/install -m 0644 -o root -g root /run/claudepod-subgid /etc/subgid
   '';
 in {
   imports = [
@@ -96,12 +89,20 @@ in {
     users.groups.users.gid = 100;
 
     security.sudo.wheelNeedsPassword = false;
+    security.pam.services.claudepod = {
+      startSession = true;
+      setLoginUid = false;
+      rootOK = true;
+      unixAuth = false;
+      pamMount = false;
+    };
 
     virtualisation.podman.enable = true;
 
     systemd.services.claudepod-runtime-user = {
       description = "Create claudepod runtime user";
       before = ["claudepod-shell.service"];
+      unitConfig.FailureAction = "poweroff";
       serviceConfig = {
         Type = "oneshot";
         RemainAfterExit = true;
@@ -114,18 +115,22 @@ in {
       requires = ["claudepod-runtime-user.service"];
       after = ["multi-user.target" "claudepod-runtime-user.service"];
       wantedBy = ["multi-user.target"];
+      unitConfig = {
+        SuccessAction = "poweroff";
+        FailureAction = "poweroff";
+      };
       serviceConfig = {
         Type = "simple";
         User = "1000";
         Group = "100";
-        Environment = "XDG_RUNTIME_DIR=/run/user/1000";
+        Environment = "container=podman";
+        PAMName = "claudepod";
         StandardInput = "tty";
         StandardOutput = "tty";
         TTYPath = "/dev/console";
         TTYReset = true;
         TTYVHangup = true;
         ExecStart = "${claudepodStart}";
-        ExecStopPost = "+" + "${pkgs.util-linux}/bin/kill -SIGRTMIN+14 1";
       };
     };
 
@@ -176,6 +181,7 @@ in {
 
     services.logrotate.enable = false;
     documentation.enable = false;
+    services.journald.storage = "volatile";
 
     networking = {
       useDHCP = false;
