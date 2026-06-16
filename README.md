@@ -1,9 +1,10 @@
 `claudepod` is a Nix Home Manager module that builds and runs a tiny container.
-This project is vibe-coded personal infrastructure. Approach it as a showcase of
+This project is vibe-coded personal infrastructure. Treat it as a showcase of
 container primitives, not an off-the-shelf product.
 
 The container is meant to gently prevent a coding agent session from misusing
-ambient credentials like dotfiles. Isolation model:
+ambient credentials like dotfiles. It is not a security boundary. Isolation
+model:
 
 - dedicated container home (including `.claude` and `.codex`) and host `~/src`
   are mounted read-write and shared between instances
@@ -14,14 +15,9 @@ ambient credentials like dotfiles. Isolation model:
 - GPT 5.5 couldn't figure out a way to escape isolation
 - host Nix store is fully readable (you don't keep secrets in there, do you?)
 
-The container runs from an empty rootfs overlay: podman just manages the
-container's scratch layer. At runtime, `claudepod-start` passes
-`claudepod-entry` and the NixOS toplevel from the host store; the entry process
-sets up the store overlay, writes runtime config, and hands off to NixOS/systemd.
-Before the shell starts, systemd creates the guest user from that config (host
-username, uid 1000). The guest mounts the host Nix store read-only and uses the
-Nix daemon's local-overlay feature, consulting the host daemon for metadata
-through a read-only proxy.
+The overhead is ~20 MB RAM in systemd detritus and <1MB on disk for NixOS.
+Everything else comes from the host Nix store. Time to start, run `true` and
+shut down is around 1.2s on my machine.
 
 ## Quick Start
 
@@ -40,8 +36,8 @@ nix run github:xzrq-net/claudepod#gptpod
 ## Commands
 
 ```text
-claudepod [-s] [-V] [-v path] [-v host:guest]... [-- command [arg]...]
-gptpod    [-s] [-V] [-v path] [-v host:guest]... [-- command [arg]...]
+claudepod [-s] [-V] [-v path] [-v host:guest]... [--] [command [arg]...]
+gptpod    [-s] [-V] [-v path] [-v host:guest]... [--] [command [arg]...]
 ```
 
 Options:
@@ -55,19 +51,18 @@ Options:
 
 Environment variables:
 
-- `CLAUDE_CODE_*`: forwarded into the guest and through systemd to the agent
-  process.
+- `CLAUDE_CODE_*`: forwarded into the guest session process.
 - `MAX_THINKING_TOKENS`: forwarded the same way when set.
 
-Default paths:
+Builtin paths:
 
 - State directory: `${XDG_DATA_HOME:-$HOME/.local/share}/claudepod`
-- Source root: `$HOME/src`
+- Source root mounted into the guest: `$HOME/src`
 
 ## Home Manager Usage
 
-The flake exposes `homeModules.default`. Enabling it adds the commands to
-`home.packages`.
+The flake exposes `homeModules.default`. Enabling it adds the `claudepod` and
+`gptpod` commands to `home.packages`.
 
 Example:
 
@@ -83,7 +78,7 @@ Example:
           programs.claudepod = {
             enable = true;
 
-            # function from guest `pkgs` to extra packages installed in the guest
+            # Function from guest `pkgs` to extra packages installed in the guest.
             extraGuestPackages = pkgs: [
               pkgs.nodePackages.pnpm
             ];
@@ -108,9 +103,9 @@ Broken down:
 - `local-overlay://`: use Nix's local overlay store implementation.
 - `lower-store=unix:///nix/.host-nix-daemon/socket`: lower-layer metadata
   queries go to a host-side proxy (`claudepod-nix-proxy`) over a bind-mounted
-  socket. The proxy forwards a small set of read-only operations to the
-  host nix-daemon and rejects everything else; store *contents* still come
-  from the read-only `/nix/store` mount.
+  socket. The proxy forwards a small set of read-only operations to the host
+  nix-daemon and rejects everything else. Store _contents_ still come from the
+  read-only `/nix/store` mount.
 - `upper-layer=/nix/.rw-store/store`: put guest-created store paths in the
   writable overlay upper layer. This is backed by tmpfs inside the container.
 - `real=/nix/store`: expose the combined lower and upper store at the normal
@@ -118,9 +113,13 @@ Broken down:
 - `check-mount=false`: skip Nix's overlay-store mount validation because it does
   not match the kernel overlayfs format reported in `/proc/mounts`.
 
-Nested claudepods flatten the store overlay stack instead of mounting an overlay
-on an overlay. `claudepod-start` bind-mounts each inherited layer at short
-`/nix/.l/<n>` paths and passes the list to the child entry via
-`CLAUDEPOD_STORE_LAYERS`; `claudepod-entry` uses it as `lowerdir=` and records
-its own writable upper layer first, in `/run/claudepod-store-layers`, for a
-nested `claudepod-start` to inherit.
+## Bonus: fun facts
+
+- Nested claudepods are supported up to half of kernel userns nesting limit. To
+  avoid kernel overlayfs nesting limits, each level's Nix store is a standalone
+  overlay listing all parents as lowerdir layers.
+- systemd is actively hostile to fast startup and requires workarounds
+  - SYSTEMD_DEFAULT_MOUNT_RATE_LIMIT_BURST=1000. Otherwise, systemd mounts a lot
+    of file systems, notices the mounts came in faster than 5/s and stalls boot.
+  - Static /etc/machine-id to avoid a ~1 s stall on fsync after writing a new
+    ID.

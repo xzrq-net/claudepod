@@ -48,10 +48,11 @@ fn run() -> Result<()> {
     if std::env::var_os("container").is_none() {
         init.env("container", "podman");
     }
-    // Podman creates a burst of bind mounts before systemd starts. systemd's
-    // default mount monitor ratelimit is only 5 events per second, and mount
-    // start jobs are held while it is ratelimited; avoid a fixed startup stall
-    // before /run/wrappers.mount without disabling the guard entirely.
+    // Early guest boot produces a burst of /proc/self/mountinfo changes.
+    // systemd's default mount monitor ratelimit is only 5 events per second,
+    // and mount start jobs are held while it is ratelimited; avoid the fixed
+    // startup stall before /run/wrappers.mount without disabling the guard
+    // entirely.
     init.env("SYSTEMD_DEFAULT_MOUNT_RATE_LIMIT_BURST", "1000");
     Err(init.exec()).context("exec NixOS init")
 }

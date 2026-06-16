@@ -85,11 +85,6 @@ in {
     # for sockets, tmpfiles/wrappers, nix-daemon, and the pam_systemd session.
     systemd.defaultUnit = "claudepod.target";
     systemd.settings.Manager.ShowStatus = "no";
-    # The rootfs is ephemeral; committing transient machine-id writes overlay
-    # data for no persistent benefit and can delay shutdown.
-    systemd.suppressedSystemUnits = [
-      "systemd-machine-id-commit.service"
-    ];
     # Ship a valid machine-id in the read-only store. systemd reads it as
     # already-initialized and skips the first-boot path that would otherwise
     # create /etc/machine-id on podman's fuse-overlayfs rootfs and fsync() it
