@@ -25,22 +25,21 @@
 
     guestModule = import ./guest-module.nix {inherit nix-index-database;};
 
-    mkClaudepod = {
-      pkgs,
-      guestSystem ? pkgs.stdenv.hostPlatform.system,
-      extraGuestPackages ? (_: []),
-    }: let
-      guest = nixpkgs.lib.nixosSystem {
-        system = guestSystem;
-        modules = [
-          guestModule
-          {claudepod = {inherit extraGuestPackages;};}
-        ];
-      };
+    mkRust = pkgs: let
       craneLib = crane.mkLib pkgs;
-      rust = craneLib.buildPackage {src = craneLib.cleanCargoSource ./.;};
-      toplevel = guest.config.system.build.toplevel;
+    in
+      craneLib.buildPackage {src = craneLib.cleanCargoSource ./.;};
+
+    mkLauncher = {
+      pkgs,
+      rust,
+      toplevel ? null,
+    }: let
       fuseOverlayfs = "${pkgs.fuse-overlayfs}/bin/fuse-overlayfs";
+      # The host launcher bakes in an explicit toplevel store path. The in-guest
+      # launcher omits it: inside a pod claudepod-start reads the path the parent
+      # booted with from /run/claudepod-toplevel instead.
+      toplevelArg = pkgs.lib.optionalString (toplevel != null) "--set CLAUDEPOD_TOPLEVEL ${toplevel}";
     in
       pkgs.runCommand "claudepod" {
         nativeBuildInputs = [pkgs.makeWrapper];
@@ -49,11 +48,42 @@
         mkdir -p $out/bin
         makeWrapper ${rust}/bin/claudepod-start $out/bin/claudepod \
           --inherit-argv0 \
-          --set CLAUDEPOD_TOPLEVEL ${toplevel} \
+          ${toplevelArg} \
           --set CLAUDEPOD_PODMAN ${pkgs.podman}/bin/podman \
           --set CLAUDEPOD_FUSE_OVERLAYFS ${fuseOverlayfs}
         ln -s claudepod $out/bin/gptpod
       '';
+
+    mkGuestLauncher = pkgs:
+      mkLauncher {
+        inherit pkgs;
+        rust = mkRust pkgs;
+      };
+
+    mkClaudepod = {
+      pkgs,
+      guestSystem ? pkgs.stdenv.hostPlatform.system,
+      extraGuestPackages ? (_: []),
+    }: let
+      rust = mkRust pkgs;
+      guest = nixpkgs.lib.nixosSystem {
+        system = guestSystem;
+        modules = [
+          guestModule
+          ({
+            pkgs,
+            ...
+          }: {
+            claudepod = {
+              inherit extraGuestPackages;
+              launcherPackage = mkGuestLauncher pkgs;
+            };
+          })
+        ];
+      };
+      toplevel = guest.config.system.build.toplevel;
+    in
+      mkLauncher {inherit pkgs rust toplevel;};
 
     claudepod = mkClaudepod {inherit pkgs;};
   in {

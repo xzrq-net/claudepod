@@ -75,6 +75,12 @@ in {
       default = _guestPkgs: [];
       description = "Function from guest pkgs to extra guest packages.";
     };
+
+    launcherPackage = lib.mkOption {
+      type = lib.types.nullOr lib.types.package;
+      default = null;
+      description = "claudepod launcher package installed in the guest.";
+    };
   };
 
   config = {
@@ -177,6 +183,7 @@ in {
       ++ [
         (pkgs.python3.withPackages (_ps: []))
       ]
+      ++ lib.optional (cfg.launcherPackage != null) cfg.launcherPackage
       ++ cfg.extraGuestPackages pkgs;
 
     programs = {

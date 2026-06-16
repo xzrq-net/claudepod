@@ -14,6 +14,7 @@ use nix::fcntl::{FcntlArg, FdFlag, fcntl};
 
 const HOST_DAEMON_SOCKET: &str = "/nix/var/nix/daemon-socket/socket";
 const STORE_LAYERS_FILE: &str = "/run/claudepod-store-layers";
+const TOPLEVEL_FILE: &str = "/run/claudepod-toplevel";
 const STORE_LAYER_MOUNT_DIR: &str = "/nix/.l";
 
 #[derive(Debug, Parser)]
@@ -40,7 +41,7 @@ fn main() -> Result<()> {
     let args = Args::parse();
 
     let command_name = command_name();
-    let toplevel = required_env_os("CLAUDEPOD_TOPLEVEL")?;
+    let toplevel = toplevel()?;
     let podman = required_env_os("CLAUDEPOD_PODMAN")?;
     let fuse_overlayfs = required_env_os("CLAUDEPOD_FUSE_OVERLAYFS")?;
     let username = username()?;
@@ -295,6 +296,24 @@ fn required_env_os(name: &str) -> Result<OsString> {
     std::env::var_os(name)
         .filter(|value| !value.is_empty())
         .with_context(|| format!("{name} is not set"))
+}
+
+/// System toplevel store path to boot in the container. The host launcher bakes
+/// an explicit store path into CLAUDEPOD_TOPLEVEL; the in-guest launcher leaves
+/// it unset, so inside a pod we read the path the parent booted with from
+/// /run/claudepod-toplevel (written by claudepod-entry, like the store-layer
+/// stack). Either way the value is an explicit store path present in the mounted
+/// /nix/store — never /run/current-system, which would not exist in the child.
+fn toplevel() -> Result<OsString> {
+    if let Some(value) = std::env::var_os("CLAUDEPOD_TOPLEVEL").filter(|value| !value.is_empty()) {
+        return Ok(value);
+    }
+    let raw = std::fs::read(TOPLEVEL_FILE).with_context(|| format!("read {TOPLEVEL_FILE}"))?;
+    let trimmed = raw.strip_suffix(b"\n").unwrap_or(&raw);
+    if trimmed.is_empty() {
+        bail!("{TOPLEVEL_FILE} is empty");
+    }
+    Ok(OsStr::from_bytes(trimmed).to_os_string())
 }
 
 fn state_dir() -> Result<PathBuf> {

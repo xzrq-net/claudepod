@@ -32,17 +32,17 @@ fn main() {
 }
 
 fn run() -> Result<()> {
-    let mut toplevel =
-        std::env::var_os("CLAUDEPOD_TOPLEVEL").context("CLAUDEPOD_TOPLEVEL is not set")?;
-    toplevel.push("/init");
+    let system = std::env::var_os("CLAUDEPOD_TOPLEVEL").context("CLAUDEPOD_TOPLEVEL is not set")?;
     let username = std::env::var("CLAUDEPOD_USERNAME").context("CLAUDEPOD_USERNAME is not set")?;
     let command: Vec<OsString> = std::env::args_os().skip(1).collect();
 
     let descendant_store_layers = setup_store_overlay().context("mount setup")?;
-    write_runtime_config(&username, &command, &descendant_store_layers)
+    write_runtime_config(&system, &username, &command, &descendant_store_layers)
         .context("write runtime config")?;
 
-    let mut init = Command::new(toplevel);
+    let mut init_path = system;
+    init_path.push("/init");
+    let mut init = Command::new(init_path);
     // Podman normally sets this via its built-in default env, but --rootfs
     // skips that path. NixOS stage 2 uses it to avoid bare-metal boot steps.
     if std::env::var_os("container").is_none() {
@@ -107,6 +107,7 @@ fn setup_store_overlay() -> Result<OsString> {
 /// under /run where the claudepod-shell unit picks them up across the
 /// systemd boundary.
 fn write_runtime_config(
+    system: &OsStr,
     username: &str,
     command: &[OsString],
     descendant_store_layers: &OsStr,
@@ -147,6 +148,13 @@ fn write_runtime_config(
     store_layers.push(b'\n');
     std::fs::write("/run/claudepod-store-layers", store_layers)
         .context("write /run/claudepod-store-layers")?;
+
+    // System toplevel for a nested claudepod-start, on the same plumbing channel:
+    // the in-guest launcher leaves CLAUDEPOD_TOPLEVEL unset and reads the explicit
+    // store path the parent booted with from here.
+    let mut toplevel = system.as_bytes().to_vec();
+    toplevel.push(b'\n');
+    std::fs::write("/run/claudepod-toplevel", toplevel).context("write /run/claudepod-toplevel")?;
 
     // The guest service reads this via `set -a; . file; set +a`, so values
     // are bash single-quoted.
