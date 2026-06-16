@@ -90,6 +90,11 @@ in {
     systemd.suppressedSystemUnits = [
       "systemd-machine-id-commit.service"
     ];
+    # Ship a valid machine-id in the read-only store. systemd reads it as
+    # already-initialized and skips the first-boot path that would otherwise
+    # create /etc/machine-id on podman's fuse-overlayfs rootfs and fsync() it
+    # synchronously before boot can continue.
+    environment.etc."machine-id".text = "4ecb2502507f468986747b937d700a13\n";
     networking.hostName = "claudepod";
 
     systemd.services.console-getty.enable = false;
