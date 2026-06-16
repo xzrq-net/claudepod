@@ -108,11 +108,11 @@ fn write_runtime_config(
     std::fs::write("/run/claudepod-username", format!("{username}\n"))
         .context("write /run/claudepod-username")?;
 
-    let mut project = env_bytes_or_default("CLAUDEPOD_PROJECT_PATH", b"/tmp");
+    let mut project = required_env_bytes("CLAUDEPOD_PROJECT_PATH")?;
     project.push(b'\n');
     std::fs::write("/run/claudepod-project", project).context("write /run/claudepod-project")?;
 
-    let mut mode = env_bytes_or_default("CLAUDEPOD_MODE", b"shell");
+    let mut mode = required_env_bytes("CLAUDEPOD_MODE")?;
     mode.push(b'\n');
     std::fs::write("/run/claudepod-mode", mode).context("write /run/claudepod-mode")?;
 
@@ -180,11 +180,12 @@ fn append_env_line(out: &mut Vec<u8>, name: &OsStr, value: &OsStr) {
     out.extend_from_slice(b"'\n");
 }
 
-fn env_bytes_or_default(name: &str, default: &[u8]) -> Vec<u8> {
-    match std::env::var_os(name) {
-        Some(value) if !value.is_empty() => value.as_bytes().to_vec(),
-        _ => default.to_vec(),
-    }
+fn required_env_bytes(name: &str) -> Result<Vec<u8>> {
+    Ok(std::env::var_os(name)
+        .filter(|value| !value.is_empty())
+        .with_context(|| format!("{name} is not set"))?
+        .as_bytes()
+        .to_vec())
 }
 
 fn subid_file_from_map_path(path: &str) -> Result<String> {
