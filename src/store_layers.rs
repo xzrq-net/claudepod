@@ -1,7 +1,6 @@
-//! Wire format for the recursive `/nix/store` overlay layer stack shared by
-//! `claudepod-start` and `claudepod-entry`: an ordered list of absolute paths
-//! (highest-priority lower layer first) joined with `:`, passed via the
-//! `CLAUDEPOD_STORE_LAYERS` env and the `/run/claudepod-store-layers` file.
+//! Encoding for recursive `/nix/store` lower-layer stacks: absolute paths in
+//! priority order (highest first), joined with `:`, passed via the
+//! `CLAUDEPOD_STORE_LAYERS` env var and `/run/claudepod-store-layers`.
 
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};

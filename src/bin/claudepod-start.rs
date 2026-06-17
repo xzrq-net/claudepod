@@ -74,9 +74,8 @@ fn main() -> Result<()> {
     let project_dir = std::env::current_dir().context("current directory")?;
     let (guest_path, need_project_share) = guest_project_path(&project_dir, &src_root, &username)?;
     let parent_layers = parent_store_layers()?;
-    // Each inherited layer is bind-mounted into the child at a short
-    // /nix/.l/<n> path (the child's lowerdir= string is length-bounded) and
-    // referenced there via CLAUDEPOD_STORE_LAYERS.
+    // Bind inherited layers at short guest paths before passing them to the
+    // child; overlayfs lowerdir strings are length-bounded.
     let child_layers: Vec<PathBuf> = (0..parent_layers.len())
         .map(|idx| PathBuf::from(STORE_LAYER_MOUNT_DIR).join(idx.to_string()))
         .collect();
@@ -197,23 +196,18 @@ fn username() -> Result<String> {
         .name)
 }
 
-/// Start the nix proxy (see docs/nix-proxy.md) and return the host path of
-/// its listening socket, ready to bind-mount into the container.
+/// Start the nix proxy and return the host path of its listening socket, ready
+/// to bind-mount into the container.
 ///
-/// The listener is bound here and passed across the exec boundary as an
-/// inherited fd, so it is accepting before podman starts — no readiness
-/// race. The proxy outlives this process's exec into podman and exits via
-/// PR_SET_PDEATHSIG when the podman process dies; it unlinks the socket on
-/// the first accepted connection (podman's bind mount pins the inode), so
-/// the happy path leaves no host filesystem residue even if the proxy is
-/// later SIGKILLed.
+/// The listener is bound here and inherited by the proxy child, so it can
+/// accept before podman starts.
 fn spawn_nix_proxy() -> Result<PathBuf> {
     if !Path::new(HOST_DAEMON_SOCKET).exists() {
         bail!("host nix daemon socket {HOST_DAEMON_SOCKET} not found; is nix-daemon running?");
     }
 
     let socket_path = proxy_socket_path()?;
-    // Pid reuse could collide with a socket leaked by a SIGKILLed proxy.
+    // Remove any stale pid-named socket left by a crashed proxy.
     match std::fs::remove_file(&socket_path) {
         Ok(()) => {}
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
@@ -251,10 +245,8 @@ fn spawn_nix_proxy() -> Result<PathBuf> {
     Ok(socket_path)
 }
 
-/// Per-instance socket path; the pid is unique for the session's lifetime
-/// since this process becomes podman via exec. Prefer XDG_RUNTIME_DIR
-/// (tmpfs, wiped at logout) so even a SIGKILLed proxy leaves nothing
-/// durable.
+/// Per-instance socket path. Prefer XDG_RUNTIME_DIR; fall back to a private
+/// state dir where stale sockets are removed before binding.
 fn proxy_socket_path() -> Result<PathBuf> {
     let name = format!("nix-proxy-{}.sock", std::process::id());
     let dirs = xdg::BaseDirectories::with_prefix("claudepod");
@@ -298,12 +290,9 @@ fn required_env_os(name: &str) -> Result<OsString> {
         .with_context(|| format!("{name} is not set"))
 }
 
-/// System toplevel store path to boot in the container. The host launcher bakes
-/// an explicit store path into CLAUDEPOD_TOPLEVEL; the in-guest launcher leaves
-/// it unset, so inside a pod we read the path the parent booted with from
-/// /run/claudepod-toplevel (written by claudepod-entry, like the store-layer
-/// stack). Either way the value is an explicit store path present in the mounted
-/// /nix/store — never /run/current-system, which would not exist in the child.
+/// System toplevel store path to boot in the container. Host launchers set
+/// CLAUDEPOD_TOPLEVEL; nested launchers read the path written by the parent
+/// entrypoint.
 fn toplevel() -> Result<OsString> {
     if let Some(value) = std::env::var_os("CLAUDEPOD_TOPLEVEL").filter(|value| !value.is_empty()) {
         return Ok(value);
@@ -351,11 +340,9 @@ fn env_arg(name: &str, value: &OsStr) -> OsString {
     arg
 }
 
-/// Store layers to hand the child, in priority order (highest first). Inside
-/// a pod the parent's entry recorded its flattened stack in
-/// /run/claudepod-store-layers (see setup_store_overlay in claudepod-entry);
-/// at the top level on the host the file is absent and there is just the host
-/// store.
+/// Store layers to hand the child, in priority order (highest first). Nested
+/// launchers read the parent's flattened stack; top-level launchers use only
+/// the host store.
 fn parent_store_layers() -> Result<Vec<PathBuf>> {
     let raw = match std::fs::read(STORE_LAYERS_FILE) {
         Ok(raw) => raw,

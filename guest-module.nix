@@ -228,8 +228,11 @@ in {
       "d /run/user/1000 0700 1000 100 - -"
     ];
 
-    # check-mount=false: nix overlay store check-mount validation doesn't match kernel overlayfs /proc/mounts format
-    # lower-store: host-side nix proxy socket, bind-mounted in by claudepod-start (see docs/nix-proxy.md)
+    # local-overlay store parameters:
+    # - real=/nix/store: merged overlay mounted by claudepod-entry
+    # - upper-layer=/nix/.rw-store/store: tmpfs-backed writable layer
+    # - lower-store=...: host-side nix proxy socket bind-mounted by claudepod-start
+    # - check-mount=false: nix's overlay check does not match kernel overlayfs /proc/mounts
     systemd.services.nix-daemon.environment.NIX_REMOTE = "local-overlay://?lower-store=unix%%3A%%2F%%2F%%2Fnix%%2F.host-nix-daemon%%2Fsocket&upper-layer=/nix/.rw-store/store&real=/nix/store&check-mount=false";
   };
 }

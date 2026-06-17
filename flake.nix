@@ -36,9 +36,8 @@
       toplevel ? null,
     }: let
       fuseOverlayfs = "${pkgs.fuse-overlayfs}/bin/fuse-overlayfs";
-      # The host launcher bakes in an explicit toplevel store path. The in-guest
-      # launcher omits it: inside a pod claudepod-start reads the path the parent
-      # booted with from /run/claudepod-toplevel instead.
+      # Host launchers set the guest system toplevel. Nested launchers leave it
+      # unset and read /run/claudepod-toplevel from the parent container.
       toplevelArg = pkgs.lib.optionalString (toplevel != null) "--set CLAUDEPOD_TOPLEVEL ${toplevel}";
     in
       pkgs.runCommand "claudepod" {

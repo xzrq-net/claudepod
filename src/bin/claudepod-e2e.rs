@@ -1,4 +1,4 @@
-//! End-to-end test for the nix proxy (docs/nix-proxy.md "Testing").
+//! End-to-end test for the nix proxy.
 //!
 //! Run with `cargo run --bin claudepod-e2e`. Re-execs itself under
 //! user+mount+pid namespaces, builds a host store and an overlayfs
