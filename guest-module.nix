@@ -5,6 +5,11 @@
   ...
 }: let
   cfg = config.claudepod;
+  nixIndexPackages = import nix-index-database {inherit pkgs;};
+  nixLocateFull = pkgs.runCommand "nix-locate-full-db" {} ''
+    mkdir -p $out/bin
+    ln -s ${nixIndexPackages.nix-index-with-db}/bin/nix-locate $out/bin/nix-locate
+  '';
 
   claudepodShell = pkgs.writeShellScript "claudepod-shell" ''
     set -euo pipefail
@@ -181,6 +186,7 @@ in {
         wget
       ])
       ++ [
+        (lib.hiPrio nixLocateFull)
         (pkgs.python3.withPackages (_ps: []))
       ]
       ++ lib.optional (cfg.launcherPackage != null) cfg.launcherPackage
@@ -188,6 +194,7 @@ in {
 
     programs = {
       nix-ld.enable = true;
+      nix-index.package = nixIndexPackages.nix-index-with-small-db;
 
       nix-index-database.comma.enable = true;
 
