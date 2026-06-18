@@ -6,8 +6,10 @@ The container is meant to gently prevent a coding agent session from misusing
 ambient credentials like dotfiles. It is not a security boundary. Isolation
 model:
 
-- dedicated container home (including `.claude` and `.codex`) and host `~/src`
-  are mounted read-write and shared between instances
+- dedicated container home (including `.claude` and `.codex`) and, by default,
+  host `~/src` are mounted read-write and shared between instances
+- `--sandbox-home DIR` uses a caller-selected home backing directory and skips
+  the host `~/src` mount
 - current directory mounted read-write under `/projects/<name>`
 - unrestricted Internet and local network access
 - passwordless sudo into container root
@@ -36,14 +38,16 @@ nix run github:xzrq-net/claudepod#gptpod
 ## Commands
 
 ```text
-claudepod [-s] [-V] [-v path] [-v host:guest]... [--] [command [arg]...]
-gptpod    [-s] [-V] [-v path] [-v host:guest]... [--] [command [arg]...]
+claudepod [-s] [-V] [--sandbox-home DIR] [-v path] [-v host:guest]... [--] [command [arg]...]
+gptpod    [-s] [-V] [--sandbox-home DIR] [-v path] [-v host:guest]... [--] [command [arg]...]
 ```
 
 Options:
 
 - `-s`: start a login shell instead of the default agent mode.
 - `-V`: verbose mode, shows systemd boot messages in the guest.
+- `--sandbox-home DIR`: use `DIR` as the guest home backing directory and do not
+  mount host `~/src`. The current directory is still mounted as the project.
 - `-v path`: mount the same host path at the same guest path.
 - `-v host:guest`: mount a host path at a specific guest path.
 - `command [arg]...`: run this command in the project directory instead of the
@@ -57,7 +61,9 @@ Environment variables:
 Builtin paths:
 
 - State directory: `${XDG_DATA_HOME:-$HOME/.local/share}/claudepod`
-- Source root mounted into the guest: `$HOME/src`
+- Default guest home backing directory: state directory + `/home`
+- Default source root mounted into the guest: `$HOME/src`, unless
+  `--sandbox-home` is used
 
 ## Home Manager Usage
 

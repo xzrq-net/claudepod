@@ -32,6 +32,10 @@ struct Args {
     #[arg(short = 'v', value_name = "SPEC")]
     extra_volumes: Vec<OsString>,
 
+    /// Use DIR as the guest home backing directory and do not mount host ~/src.
+    #[arg(long, value_name = "DIR")]
+    sandbox_home: Option<PathBuf>,
+
     /// Command to run inside the guest.
     #[arg(value_name = "COMMAND", num_args = 0.., allow_hyphen_values = true)]
     command: Vec<OsString>,
@@ -54,7 +58,11 @@ fn main() -> Result<()> {
     };
 
     let state_dir = state_dir()?;
-    let home_dir = state_dir.join("home");
+    let home_dir = if let Some(path) = &args.sandbox_home {
+        absolute_path(path)?
+    } else {
+        state_dir.join("home")
+    };
     std::fs::create_dir_all(&home_dir).with_context(|| format!("create {}", home_dir.display()))?;
     // Lowerdir for `podman run --rootfs ...:O`; all writes go to podman's
     // temporary overlay upperdir, so this must remain empty.
@@ -70,9 +78,14 @@ fn main() -> Result<()> {
         bail!("{} is not empty", rootfs_dir.display());
     }
 
-    let src_root = src_root()?;
     let project_dir = std::env::current_dir().context("current directory")?;
-    let (guest_path, need_project_share) = guest_project_path(&project_dir, &src_root, &username)?;
+    let src_root = if args.sandbox_home.is_some() {
+        None
+    } else {
+        Some(src_root()?)
+    };
+    let (guest_path, need_project_share) =
+        guest_project_path(&project_dir, src_root.as_deref(), &username)?;
     let parent_layers = parent_store_layers()?;
     // Bind inherited layers at short guest paths before passing them to the
     // child; overlayfs lowerdir strings are length-bounded.
@@ -90,8 +103,10 @@ fn main() -> Result<()> {
             None,
         ),
         volume_spec(&home_dir, Path::new(&home), None),
-        volume_spec(&src_root, &Path::new(&home).join("src"), None),
     ];
+    if let Some(src_root) = &src_root {
+        volumes.push(volume_spec(src_root, &Path::new(&home).join("src"), None));
+    }
     for (host, guest) in parent_layers.iter().zip(&child_layers) {
         volumes.push(volume_spec(host, guest, Some("ro")));
     }
@@ -121,6 +136,10 @@ fn main() -> Result<()> {
     println!("Starting {}...", command_name.to_string_lossy());
     println!("  Host path: {}", project_dir.display());
     println!("  Guest path: {guest_path}");
+    if args.sandbox_home.is_some() {
+        println!("  Sandbox home: {}", home_dir.display());
+        println!("  Host src: disabled");
+    }
     println!();
 
     let init = std::env::current_exe()
@@ -316,6 +335,16 @@ fn src_root() -> Result<PathBuf> {
     Ok(PathBuf::from(home).join("src"))
 }
 
+fn absolute_path(path: &Path) -> Result<PathBuf> {
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        Ok(std::env::current_dir()
+            .context("current directory")?
+            .join(path))
+    }
+}
+
 fn volume_spec(host: &Path, guest: &Path, options: Option<&str>) -> OsString {
     let mut spec = OsString::from(host.as_os_str());
     spec.push(":");
@@ -358,16 +387,18 @@ fn parent_store_layers() -> Result<Vec<PathBuf>> {
 
 fn guest_project_path(
     project_dir: &Path,
-    src_root: &Path,
+    src_root: Option<&Path>,
     username: &str,
 ) -> Result<(String, bool)> {
-    if let Ok(rel_path) = project_dir.strip_prefix(src_root) {
-        let guest_path = if rel_path.as_os_str().is_empty() {
-            format!("/home/{username}/src")
-        } else {
-            format!("/home/{username}/src/{}", rel_path.display())
-        };
-        return Ok((guest_path, false));
+    if let Some(src_root) = src_root {
+        if let Ok(rel_path) = project_dir.strip_prefix(src_root) {
+            let guest_path = if rel_path.as_os_str().is_empty() {
+                format!("/home/{username}/src")
+            } else {
+                format!("/home/{username}/src/{}", rel_path.display())
+            };
+            return Ok((guest_path, false));
+        }
     }
 
     let project_name = project_dir
@@ -379,7 +410,7 @@ fn guest_project_path(
 
 #[cfg(test)]
 mod tests {
-    use super::volume_spec;
+    use super::{guest_project_path, volume_spec};
     use std::ffi::OsStr;
     use std::path::Path;
 
@@ -392,6 +423,27 @@ mod tests {
                 Some("ro")
             ),
             OsStr::new("/host path:/guest path:ro")
+        );
+    }
+
+    #[test]
+    fn projects_under_src_use_src_mount_by_default() {
+        assert_eq!(
+            guest_project_path(
+                Path::new("/host/home/src/proj"),
+                Some(Path::new("/host/home/src")),
+                "alice"
+            )
+            .unwrap(),
+            ("/home/alice/src/proj".to_string(), false)
+        );
+    }
+
+    #[test]
+    fn projects_under_src_are_mounted_separately_without_src_mount() {
+        assert_eq!(
+            guest_project_path(Path::new("/host/home/src/proj"), None, "alice").unwrap(),
+            ("/projects/proj".to_string(), true)
         );
     }
 }
