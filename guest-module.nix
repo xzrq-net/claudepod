@@ -168,6 +168,7 @@ in {
         curl
         direnv
         fd
+        file
         findutils
         gawk
         git
