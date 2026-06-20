@@ -164,6 +164,7 @@ in {
       (with pkgs; [
         bashInteractive
         bubblewrap
+        bun
         coreutils
         curl
         direnv
