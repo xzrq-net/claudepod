@@ -6,6 +6,7 @@ use std::os::unix::net::UnixListener;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::str::FromStr;
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
@@ -31,6 +32,14 @@ struct Args {
     /// Mount path, or host:guest volume spec, into the guest.
     #[arg(short = 'v', value_name = "SPEC")]
     extra_volumes: Vec<OsString>,
+
+    /// Forward guest localhost port to host localhost port: PORT or GUEST:HOST.
+    #[arg(long, value_name = "PORT|GUEST:HOST")]
+    host_port: Vec<PortMap>,
+
+    /// Publish a guest port on host localhost: PORT or HOST:GUEST.
+    #[arg(short = 'p', long, value_name = "PORT|HOST:GUEST")]
+    publish: Vec<PortMap>,
 
     /// Use DIR as the guest home backing directory and do not mount host ~/src.
     #[arg(long, value_name = "DIR")]
@@ -140,6 +149,18 @@ fn main() -> Result<()> {
         println!("  Sandbox home: {}", home_dir.display());
         println!("  Host src: disabled");
     }
+    for port in &args.host_port {
+        println!(
+            "  Guest localhost:{} -> host localhost:{}",
+            port.left, port.right
+        );
+    }
+    for port in &args.publish {
+        println!(
+            "  Host localhost:{} -> guest port {}",
+            port.left, port.right
+        );
+    }
     println!();
 
     let init = std::env::current_exe()
@@ -177,6 +198,14 @@ fn main() -> Result<()> {
     command
         .arg("--storage-opt")
         .arg(env_arg("overlay.mount_program", &fuse_overlayfs));
+    if !args.host_port.is_empty() {
+        command
+            .arg("--network")
+            .arg(pasta_tcp_ns_arg(&args.host_port));
+    }
+    for port in &args.publish {
+        command.arg("-p").arg(publish_arg(port));
+    }
     for volume in volumes {
         command.arg("-v").arg(volume);
     }
@@ -362,6 +391,70 @@ fn rootfs_spec(rootfs_dir: &Path) -> OsString {
     spec
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct PortMap {
+    left: u16,
+    right: u16,
+}
+
+impl FromStr for PortMap {
+    type Err = String;
+
+    fn from_str(spec: &str) -> std::result::Result<Self, Self::Err> {
+        if let Some((left, right)) = spec.split_once(':') {
+            if right.contains(':') {
+                return Err("expected PORT or LEFT:RIGHT".to_string());
+            }
+            Ok(Self {
+                left: parse_port(left)?,
+                right: parse_port(right)?,
+            })
+        } else {
+            let port = parse_port(spec)?;
+            Ok(Self {
+                left: port,
+                right: port,
+            })
+        }
+    }
+}
+
+fn parse_port(raw: &str) -> std::result::Result<u16, String> {
+    let port: u16 = raw
+        .parse()
+        .map_err(|_| format!("{raw:?} is not a valid TCP port"))?;
+    if port == 0 {
+        Err("port 0 is not supported".to_string())
+    } else {
+        Ok(port)
+    }
+}
+
+fn port_map_spec(port: &PortMap) -> String {
+    if port.left == port.right {
+        port.left.to_string()
+    } else {
+        format!("{}:{}", port.left, port.right)
+    }
+}
+
+fn pasta_tcp_ns_arg(ports: &[PortMap]) -> OsString {
+    let mut arg = String::from("pasta");
+    for (idx, port) in ports.iter().enumerate() {
+        if idx == 0 {
+            arg.push_str(":-T,");
+        } else {
+            arg.push_str(",-T,");
+        }
+        arg.push_str(&port_map_spec(port));
+    }
+    OsString::from(arg)
+}
+
+fn publish_arg(port: &PortMap) -> String {
+    format!("127.0.0.1:{}:{}", port.left, port.right)
+}
+
 fn env_arg(name: &str, value: &OsStr) -> OsString {
     let mut arg = OsString::from(name);
     arg.push("=");
@@ -410,7 +503,7 @@ fn guest_project_path(
 
 #[cfg(test)]
 mod tests {
-    use super::{guest_project_path, volume_spec};
+    use super::{PortMap, guest_project_path, pasta_tcp_ns_arg, publish_arg, volume_spec};
     use std::ffi::OsStr;
     use std::path::Path;
 
@@ -445,5 +538,46 @@ mod tests {
             guest_project_path(Path::new("/host/home/src/proj"), None, "alice").unwrap(),
             ("/projects/proj".to_string(), true)
         );
+    }
+
+    #[test]
+    fn port_maps_parse_single_or_pair() {
+        assert_eq!(
+            "3000".parse::<PortMap>().unwrap(),
+            PortMap {
+                left: 3000,
+                right: 3000
+            }
+        );
+        assert_eq!(
+            "8080:3000".parse::<PortMap>().unwrap(),
+            PortMap {
+                left: 8080,
+                right: 3000
+            }
+        );
+        assert!("0".parse::<PortMap>().is_err());
+        assert!("8080:".parse::<PortMap>().is_err());
+        assert!("1:2:3".parse::<PortMap>().is_err());
+    }
+
+    #[test]
+    fn port_maps_render_podman_args() {
+        let ports = [
+            PortMap {
+                left: 15432,
+                right: 5432,
+            },
+            PortMap {
+                left: 3000,
+                right: 3000,
+            },
+        ];
+        assert_eq!(
+            pasta_tcp_ns_arg(&ports),
+            OsStr::new("pasta:-T,15432:5432,-T,3000")
+        );
+        assert_eq!(publish_arg(&ports[0]), "127.0.0.1:15432:5432");
+        assert_eq!(publish_arg(&ports[1]), "127.0.0.1:3000:3000");
     }
 }

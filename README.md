@@ -38,8 +38,8 @@ nix run github:xzrq-net/claudepod#gptpod
 ## Commands
 
 ```text
-claudepod [-s] [-V] [--sandbox-home DIR] [-v path] [-v host:guest]... [--] [command [arg]...]
-gptpod    [-s] [-V] [--sandbox-home DIR] [-v path] [-v host:guest]... [--] [command [arg]...]
+claudepod [-s] [-V] [--sandbox-home DIR] [--host-port PORT|GUEST:HOST]... [-p PORT|HOST:GUEST]... [-v path] [-v host:guest]... [--] [command [arg]...]
+gptpod    [-s] [-V] [--sandbox-home DIR] [--host-port PORT|GUEST:HOST]... [-p PORT|HOST:GUEST]... [-v path] [-v host:guest]... [--] [command [arg]...]
 ```
 
 Options:
@@ -48,6 +48,15 @@ Options:
 - `-V`: verbose mode, shows systemd boot messages in the guest.
 - `--sandbox-home DIR`: use `DIR` as the guest home backing directory and do not
   mount host `~/src`. The current directory is still mounted as the project.
+- `--host-port PORT`: make guest `127.0.0.1:PORT` connect to host
+  `127.0.0.1:PORT`.
+- `--host-port GUEST:HOST`: make guest `127.0.0.1:GUEST` connect to host
+  `127.0.0.1:HOST`.
+- `-p PORT`, `--publish PORT`: publish guest port `PORT` on host
+  `127.0.0.1:PORT`.
+- `-p HOST:GUEST`, `--publish HOST:GUEST`: publish guest port `GUEST` on host
+  `127.0.0.1:HOST`. The guest service should bind `0.0.0.0:GUEST` or the guest
+  interface address, not guest `127.0.0.1:GUEST`.
 - `-v path`: mount the same host path at the same guest path.
 - `-v host:guest`: mount a host path at a specific guest path.
 - `command [arg]...`: run this command in the project directory instead of the
