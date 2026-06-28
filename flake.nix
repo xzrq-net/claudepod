@@ -19,11 +19,17 @@
     nix-index-database,
     ...
   }: let
-    pkgs = import nixpkgs {
-      system = "x86_64-linux";
+    nixpkgsConfig = {
+      allowUnfree = true;
+      allowAliases = false;
     };
 
-    guestModule = import ./guest-module.nix {inherit nix-index-database;};
+    pkgs = import nixpkgs {
+      system = "x86_64-linux";
+      config = nixpkgsConfig;
+    };
+
+    guestModule = import ./guest-module.nix {inherit nix-index-database nixpkgs nixpkgsConfig;};
 
     mkRust = pkgs: let
       craneLib = crane.mkLib pkgs;
@@ -33,12 +39,33 @@
     mkLauncher = {
       pkgs,
       rust,
-      toplevel ? null,
+      guestIdentity ? null,
     }: let
+      hostNix = import nixpkgs {
+        system = pkgs.stdenv.hostPlatform.system;
+        config = nixpkgsConfig;
+      };
+      toplevel = if guestIdentity == null then null else guestIdentity.toplevel;
       fuseOverlayfs = "${pkgs.fuse-overlayfs}/bin/fuse-overlayfs";
-      # Host launchers set the guest system toplevel. Nested launchers leave it
-      # unset and read /run/claudepod-toplevel from the parent container.
-      toplevelArg = pkgs.lib.optionalString (toplevel != null) "--set CLAUDEPOD_TOPLEVEL ${toplevel}";
+      # Host launchers set guest identity for host-side cache/policy decisions:
+      # toplevel boots one NixOS closure; guestSystem evaluates the pinned
+      # nixpkgs package universe for manifest/cache generation.
+      # Nested launchers leave these unset and read /run/claudepod-toplevel from
+      # the parent container instead.
+      guestIdentityArgs = pkgs.lib.optionalString (guestIdentity != null) (pkgs.lib.escapeShellArgs [
+        "--set"
+        "CLAUDEPOD_TOPLEVEL"
+        "${guestIdentity.toplevel}"
+        "--set"
+        "CLAUDEPOD_GUEST_SYSTEM"
+        guestIdentity.guestSystem
+        "--set"
+        "CLAUDEPOD_NIXPKGS"
+        "${nixpkgs}"
+        "--set"
+        "CLAUDEPOD_NIX"
+        "${hostNix.nix}/bin/nix"
+      ]);
     in
       pkgs.runCommand "claudepod" {
         nativeBuildInputs = [pkgs.makeWrapper];
@@ -47,7 +74,7 @@
         mkdir -p $out/bin
         makeWrapper ${rust}/bin/claudepod-start $out/bin/claudepod \
           --inherit-argv0 \
-          ${toplevelArg} \
+          ${guestIdentityArgs} \
           --set CLAUDEPOD_PODMAN ${pkgs.podman}/bin/podman \
           --set CLAUDEPOD_FUSE_OVERLAYFS ${fuseOverlayfs}
         ln -s claudepod $out/bin/gptpod
@@ -82,7 +109,10 @@
       };
       toplevel = guest.config.system.build.toplevel;
     in
-      mkLauncher {inherit pkgs rust toplevel;};
+      mkLauncher {
+        inherit pkgs rust;
+        guestIdentity = {inherit toplevel guestSystem;};
+      };
 
     claudepod = mkClaudepod {inherit pkgs;};
   in {

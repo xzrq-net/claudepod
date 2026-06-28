@@ -1,4 +1,8 @@
-{nix-index-database}: {
+{
+  nix-index-database,
+  nixpkgs,
+  nixpkgsConfig,
+}: {
   config,
   lib,
   pkgs,
@@ -90,6 +94,7 @@ in {
 
   config = {
     system.stateVersion = lib.trivial.release;
+    nixpkgs.config = nixpkgsConfig;
 
     boot.isNspawnContainer = true;
     # Boot only the session target claudepod needs, while keeping basic/logind
@@ -226,7 +231,10 @@ in {
       nameserver 8.8.4.4
     '';
 
-    nix.settings.experimental-features = ["nix-command" "flakes" "local-overlay-store"];
+    nix = {
+      registry.nixpkgs.flake = nixpkgs;
+      settings.experimental-features = ["nix-command" "flakes" "local-overlay-store"];
+    };
 
     # Only root (the guest nix-daemon) may reach the proxy socket; podman
     # creates the mountpoint parent 0755, which would let any guest uid
