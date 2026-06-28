@@ -176,6 +176,7 @@ fn main() -> Result<()> {
         "run",
         "--rm",
         "-it",
+        "--log-driver=none",
         "--userns=keep-id:uid=1000,gid=100",
         "--user",
         "0:0",
