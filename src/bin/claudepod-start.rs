@@ -14,6 +14,9 @@ use claudepod::store_layers;
 use nix::fcntl::{FcntlArg, FdFlag, fcntl};
 
 const HOST_DAEMON_SOCKET: &str = "/nix/var/nix/daemon-socket/socket";
+const HOST_LOCALTIME: &str = "/etc/localtime";
+const HOST_ZONEINFO: &str = "/etc/zoneinfo";
+const TIMEZONE_ENV: &str = "CLAUDEPOD_TIMEZONE";
 const STORE_LAYERS_FILE: &str = "/run/claudepod-store-layers";
 const TOPLEVEL_FILE: &str = "/run/claudepod-toplevel";
 const STORE_LAYER_MOUNT_DIR: &str = "/nix/.l";
@@ -96,6 +99,7 @@ fn main() -> Result<()> {
     let (guest_path, need_project_share) =
         guest_project_path(&project_dir, src_root.as_deref(), &username)?;
     let parent_layers = parent_store_layers()?;
+    let timezone = host_timezone();
     // Bind inherited layers at short guest paths before passing them to the
     // child; overlayfs lowerdir strings are length-bounded.
     let child_layers: Vec<PathBuf> = (0..parent_layers.len())
@@ -214,6 +218,11 @@ fn main() -> Result<()> {
     }
     if args.verbose {
         command.arg("-e").arg("CLAUDEPOD_VERBOSE=1");
+    }
+    if let Some(timezone) = &timezone {
+        command
+            .arg("-e")
+            .arg(env_arg(TIMEZONE_ENV, timezone.as_os_str()));
     }
     command.arg("-e").arg(env_arg(
         store_layers::STORE_LAYERS_ENV,
@@ -476,6 +485,21 @@ fn parent_store_layers() -> Result<Vec<PathBuf>> {
     let trimmed = raw.strip_suffix(b"\n").unwrap_or(&raw);
     store_layers::parse(OsStr::from_bytes(trimmed))
         .with_context(|| format!("parse {STORE_LAYERS_FILE}"))
+}
+
+fn host_timezone() -> Option<PathBuf> {
+    if let Ok(target) = std::fs::read_link(HOST_LOCALTIME) {
+        if let Ok(timezone) = target.strip_prefix(HOST_ZONEINFO) {
+            if !timezone.as_os_str().is_empty() {
+                return Some(timezone.to_path_buf());
+            }
+        }
+    }
+
+    eprintln!(
+        "claudepod-start: host timezone is not a NixOS /etc/zoneinfo symlink; guest will use its default timezone"
+    );
+    None
 }
 
 fn guest_project_path(

@@ -5,14 +5,15 @@
 //!
 //! Configuration arrives via environment variables set by claudepod-start
 //! (CLAUDEPOD_TOPLEVEL, CLAUDEPOD_USERNAME, CLAUDEPOD_PROJECT_PATH,
-//! CLAUDEPOD_MODE, CLAUDEPOD_VERBOSE, CLAUDE_CODE_*); the agent command
-//! arrives as argv.
+//! CLAUDEPOD_MODE, CLAUDEPOD_TIMEZONE, CLAUDEPOD_VERBOSE,
+//! CLAUDE_CODE_*); the agent command arrives as argv.
 
 use std::ffi::{OsStr, OsString};
 use std::fmt::Write as _;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::symlink;
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
@@ -21,6 +22,7 @@ use nix::mount::{MsFlags, mount};
 
 const RUNTIME_UID: u64 = 1000;
 const SUBID_DELEGATE_START: u64 = RUNTIME_UID + 1;
+const TIMEZONE_ENV: &str = "CLAUDEPOD_TIMEZONE";
 const STORE_UPPER_DIR: &str = "/nix/.rw-store/store";
 
 fn main() {
@@ -38,6 +40,7 @@ fn run() -> Result<()> {
     let descendant_store_layers = setup_store_overlay().context("mount setup")?;
     write_runtime_config(&system, &username, &command, &descendant_store_layers)
         .context("write runtime config")?;
+    setup_localtime().context("setup localtime")?;
 
     let mut init_path = system;
     init_path.push("/init");
@@ -95,6 +98,21 @@ fn setup_store_overlay() -> Result<OsString> {
     let mut descendant_layers = vec![PathBuf::from(STORE_UPPER_DIR)];
     descendant_layers.extend(lower_layers);
     Ok(store_layers::join(&descendant_layers))
+}
+
+fn setup_localtime() -> Result<()> {
+    let Some(timezone) = std::env::var_os(TIMEZONE_ENV).filter(|value| !value.is_empty()) else {
+        return Ok(());
+    };
+
+    let target = Path::new("/etc/zoneinfo").join(timezone);
+    match std::fs::remove_file("/etc/localtime") {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err).context("remove /etc/localtime"),
+    }
+    symlink(&target, "/etc/localtime")
+        .with_context(|| format!("create /etc/localtime -> {}", target.display()))
 }
 
 /// Project path, mode, agent command, and forwarded environment, written
