@@ -755,12 +755,11 @@ fn parent_store_layers() -> Result<Vec<PathBuf>> {
 }
 
 fn host_timezone() -> Option<PathBuf> {
-    if let Ok(target) = std::fs::read_link(HOST_LOCALTIME) {
-        if let Ok(timezone) = target.strip_prefix(HOST_ZONEINFO) {
-            if !timezone.as_os_str().is_empty() {
-                return Some(timezone.to_path_buf());
-            }
-        }
+    if let Ok(target) = std::fs::read_link(HOST_LOCALTIME)
+        && let Ok(timezone) = target.strip_prefix(HOST_ZONEINFO)
+        && !timezone.as_os_str().is_empty()
+    {
+        return Some(timezone.to_path_buf());
     }
 
     eprintln!(
@@ -774,15 +773,15 @@ fn guest_project_path(
     src_root: Option<&Path>,
     username: &str,
 ) -> Result<(String, bool)> {
-    if let Some(src_root) = src_root {
-        if let Ok(rel_path) = project_dir.strip_prefix(src_root) {
-            let guest_path = if rel_path.as_os_str().is_empty() {
-                format!("/home/{username}/src")
-            } else {
-                format!("/home/{username}/src/{}", rel_path.display())
-            };
-            return Ok((guest_path, false));
-        }
+    if let Some(src_root) = src_root
+        && let Ok(rel_path) = project_dir.strip_prefix(src_root)
+    {
+        let guest_path = if rel_path.as_os_str().is_empty() {
+            format!("/home/{username}/src")
+        } else {
+            format!("/home/{username}/src/{}", rel_path.display())
+        };
+        return Ok((guest_path, false));
     }
 
     let project_name = project_dir
