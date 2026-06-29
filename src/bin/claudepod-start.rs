@@ -48,6 +48,10 @@ struct Args {
     #[arg(long, value_name = "DIR")]
     sandbox_home: Option<PathBuf>,
 
+    /// Build the nix run-root manifest cache before starting.
+    #[arg(long)]
+    build_nix_run_roots: bool,
+
     /// Command to run inside the guest.
     #[arg(value_name = "COMMAND", num_args = 0.., allow_hyphen_values = true)]
     command: Vec<OsString>,
@@ -106,7 +110,8 @@ fn main() -> Result<()> {
         .map(|idx| PathBuf::from(STORE_LAYER_MOUNT_DIR).join(idx.to_string()))
         .collect();
 
-    let proxy_socket = spawn_nix_proxy()?;
+    let nix_run_roots = nix_run_roots_manifest(&toplevel, args.build_nix_run_roots)?;
+    let proxy_socket = spawn_nix_proxy(nix_run_roots.as_deref())?;
 
     let mut volumes = vec![
         volume_spec(Path::new("/nix/store"), Path::new("/nix/store"), Some("ro")),
@@ -259,7 +264,7 @@ fn username() -> Result<String> {
 ///
 /// The listener is bound here and inherited by the proxy child, so it can
 /// accept before podman starts.
-fn spawn_nix_proxy() -> Result<PathBuf> {
+fn spawn_nix_proxy(nix_run_roots: Option<&Path>) -> Result<PathBuf> {
     if !Path::new(HOST_DAEMON_SOCKET).exists() {
         bail!("host nix daemon socket {HOST_DAEMON_SOCKET} not found; is nix-daemon running?");
     }
@@ -291,11 +296,16 @@ fn spawn_nix_proxy() -> Result<PathBuf> {
     let proxy_bin = std::env::current_exe()
         .context("resolve own executable path")?
         .with_file_name("claudepod-nix-proxy");
-    Command::new(&proxy_bin)
+    let mut command = Command::new(&proxy_bin);
+    command
         .arg("--listen-fd")
         .arg(listener.as_raw_fd().to_string())
         .arg("--parent-pid")
-        .arg(std::process::id().to_string())
+        .arg(std::process::id().to_string());
+    if let Some(path) = nix_run_roots {
+        command.arg("--nix-run-roots").arg(path);
+    }
+    command
         .stdin(Stdio::null())
         .spawn()
         .with_context(|| format!("spawn {}", proxy_bin.display()))?;
@@ -367,6 +377,76 @@ fn state_dir() -> Result<PathBuf> {
     xdg::BaseDirectories::with_prefix("claudepod")
         .get_data_home()
         .ok_or_else(|| anyhow!("HOME is not set and XDG_DATA_HOME is unavailable"))
+}
+
+fn nix_run_roots_manifest(toplevel: &OsStr, build: bool) -> Result<Option<PathBuf>> {
+    let guest_system = std::env::var_os("CLAUDEPOD_GUEST_SYSTEM").filter(|value| !value.is_empty());
+    let nixpkgs = std::env::var_os("CLAUDEPOD_NIXPKGS").filter(|value| !value.is_empty());
+    let (Some(guest_system), Some(nixpkgs)) = (guest_system, nixpkgs) else {
+        if build {
+            bail!("--build-nix-run-roots requires CLAUDEPOD_GUEST_SYSTEM and CLAUDEPOD_NIXPKGS");
+        }
+        return Ok(None);
+    };
+
+    let path = nix_run_roots_manifest_path(&guest_system, &nixpkgs, toplevel)?;
+    if path
+        .try_exists()
+        .with_context(|| format!("stat {}", path.display()))?
+    {
+        claudepod::proxy::NixRunRoots::load(&path)?;
+        return Ok(Some(path));
+    }
+
+    if build {
+        bail!(
+            "nix run root manifest {} is missing; --build-nix-run-roots is not implemented yet",
+            path.display()
+        );
+    }
+
+    eprintln!("nix run root manifest missing; proxy fills disabled");
+    eprintln!("run: claudepod --build-nix-run-roots");
+    Ok(None)
+}
+
+fn nix_run_roots_manifest_path(
+    guest_system: &OsStr,
+    nixpkgs: &OsStr,
+    toplevel: &OsStr,
+) -> Result<PathBuf> {
+    let relative = nix_run_roots_manifest_relative_path(guest_system, nixpkgs, toplevel)?;
+    xdg::BaseDirectories::with_prefix("claudepod")
+        .get_cache_file(relative)
+        .ok_or_else(|| anyhow!("HOME is not set and XDG_CACHE_HOME is unavailable"))
+}
+
+fn nix_run_roots_manifest_relative_path(
+    guest_system: &OsStr,
+    nixpkgs: &OsStr,
+    toplevel: &OsStr,
+) -> Result<PathBuf> {
+    let guest_system = cache_path_segment("CLAUDEPOD_GUEST_SYSTEM", guest_system)?;
+    let nixpkgs_hash = claudepod::store_path::direct_hash(Path::new(nixpkgs))
+        .with_context(|| format!("parse CLAUDEPOD_NIXPKGS={}", nixpkgs.to_string_lossy()))?;
+    let toplevel_hash = claudepod::store_path::direct_hash(Path::new(toplevel))
+        .with_context(|| format!("parse selected toplevel={}", toplevel.to_string_lossy()))?;
+
+    Ok(PathBuf::from("nix-run-roots")
+        .join("v1")
+        .join(guest_system)
+        .join(nixpkgs_hash)
+        .join(format!("{toplevel_hash}.txt")))
+}
+
+fn cache_path_segment<'a>(name: &str, value: &'a OsStr) -> Result<&'a str> {
+    let bytes = value.as_bytes();
+    if bytes.is_empty() || bytes.contains(&b'/') || bytes == b"." || bytes == b".." {
+        bail!("{name} is not a valid cache path segment");
+    }
+    value
+        .to_str()
+        .ok_or_else(|| anyhow!("{name} is not valid UTF-8"))
 }
 
 fn src_root() -> Result<PathBuf> {
@@ -528,7 +608,10 @@ fn guest_project_path(
 
 #[cfg(test)]
 mod tests {
-    use super::{PortMap, guest_project_path, pasta_tcp_ns_arg, publish_arg, volume_spec};
+    use super::{
+        PortMap, guest_project_path, nix_run_roots_manifest_relative_path, pasta_tcp_ns_arg,
+        publish_arg, volume_spec,
+    };
     use std::ffi::OsStr;
     use std::path::Path;
 
@@ -604,5 +687,30 @@ mod tests {
         );
         assert_eq!(publish_arg(&ports[0]), "127.0.0.1:15432:5432");
         assert_eq!(publish_arg(&ports[1]), "127.0.0.1:3000:3000");
+    }
+
+    #[test]
+    fn nix_run_roots_manifest_relative_path_uses_store_hashes() {
+        assert_eq!(
+            nix_run_roots_manifest_relative_path(
+                OsStr::new("x86_64-linux"),
+                OsStr::new("/nix/store/nixpkgs123-source"),
+                OsStr::new("/nix/store/top123-nixos-system-host")
+            )
+            .unwrap(),
+            Path::new("nix-run-roots")
+                .join("v1")
+                .join("x86_64-linux")
+                .join("nixpkgs123")
+                .join("top123.txt")
+        );
+        assert!(
+            nix_run_roots_manifest_relative_path(
+                OsStr::new("../bad"),
+                OsStr::new("/nix/store/nixpkgs123-source"),
+                OsStr::new("/nix/store/top123-nixos-system-host")
+            )
+            .is_err()
+        );
     }
 }

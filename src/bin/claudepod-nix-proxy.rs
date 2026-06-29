@@ -33,6 +33,9 @@ struct Args {
     /// Host nix daemon socket to forward to.
     #[arg(long, default_value = "/nix/var/nix/daemon-socket/socket")]
     upstream: PathBuf,
+    /// Nix run-root manifest authorizing future on-demand fills.
+    #[arg(long, value_name = "PATH")]
+    nix_run_roots: Option<PathBuf>,
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -67,6 +70,12 @@ async fn run(args: Args, listener: StdUnixListener, socket_path: Option<PathBuf>
     if nix::unistd::getppid().as_raw() != args.parent_pid {
         bail!("parent {} died before proxy startup", args.parent_pid);
     }
+
+    let _nix_run_roots = args
+        .nix_run_roots
+        .as_deref()
+        .map(claudepod::proxy::NixRunRoots::load)
+        .transpose()?;
 
     listener
         .set_nonblocking(true)

@@ -11,9 +11,12 @@ use tokio::sync::Semaphore;
 
 mod handshake;
 mod ops;
+mod run_roots;
 mod session;
 mod stderr;
 mod wire;
+
+pub use run_roots::NixRunRoots;
 
 /// Cap on concurrent sessions, and thereby on host daemon connections (the
 /// host daemon forks a child per connection). Backpressure, not rejection:
