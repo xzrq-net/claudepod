@@ -10,6 +10,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Semaphore;
 
 mod handshake;
+mod host_client;
 mod ops;
 mod run_roots;
 mod session;

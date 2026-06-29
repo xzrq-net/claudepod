@@ -90,6 +90,97 @@ where
     }
 }
 
+/// Drain stderr messages from the host daemon without relaying them. Used by
+/// proxy-owned host operations; `STDERR_ERROR` becomes an error containing the
+/// daemon error plus log text seen before it.
+pub async fn drain_to_last<R>(host: &mut R) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut logs = Vec::new();
+    loop {
+        let msg = wire::read_u64(host).await?;
+        match msg {
+            STDERR_LAST => return Ok(()),
+            STDERR_ERROR => {
+                let mut message = read_error_message(host).await?;
+                if !logs.is_empty() {
+                    message.push_str("; logs: ");
+                    message.push_str(&logs.join(" | "));
+                }
+                bail!("{message}");
+            }
+            STDERR_NEXT => {
+                let text = wire::read_string(host, wire::MAX_HOST_STRING).await?;
+                push_log(&mut logs, text);
+            }
+            STDERR_START_ACTIVITY => {
+                wire::read_u64(host).await?; // activity id
+                wire::read_u64(host).await?; // verbosity
+                wire::read_u64(host).await?; // activity type
+                let text = wire::read_string(host, wire::MAX_HOST_STRING).await?;
+                push_log(&mut logs, text);
+                drain_fields(host, &mut logs).await?;
+                wire::read_u64(host).await?; // parent activity id
+            }
+            STDERR_STOP_ACTIVITY => {
+                wire::read_u64(host).await?; // activity id
+            }
+            STDERR_RESULT => {
+                wire::read_u64(host).await?; // activity id
+                wire::read_u64(host).await?; // result type
+                drain_fields(host, &mut logs).await?;
+            }
+            STDERR_READ | STDERR_WRITE => {
+                bail!("host daemon sent streaming stderr message {msg:#x} during proxy-owned op");
+            }
+            _ => bail!("unknown stderr message {msg:#x} from host daemon"),
+        }
+    }
+}
+
+fn push_log(logs: &mut Vec<String>, raw: Vec<u8>) {
+    let text = String::from_utf8_lossy(&raw).trim_end().to_string();
+    if !text.is_empty() {
+        logs.push(text);
+    }
+}
+
+async fn read_error_message<R>(host: &mut R) -> Result<String>
+where
+    R: AsyncRead + Unpin,
+{
+    wire::read_string(host, wire::MAX_HOST_STRING).await?; // type, usually "Error"
+    wire::read_u64(host).await?; // verbosity level
+    wire::read_string(host, wire::MAX_HOST_STRING).await?; // name (removed field)
+    let mut message = format!(
+        "host daemon error: {}",
+        text(wire::read_string(host, wire::MAX_HOST_STRING).await?)
+    );
+    let have_pos = wire::read_u64(host).await?;
+    ensure!(have_pos == 0, "error positions are not supported");
+    let trace_count = wire::read_u64(host).await?;
+    ensure!(
+        trace_count <= wire::MAX_COUNT,
+        "trace count {trace_count} exceeds limit"
+    );
+    let mut traces = Vec::with_capacity(trace_count as usize);
+    for _ in 0..trace_count {
+        let have_pos = wire::read_u64(host).await?;
+        ensure!(have_pos == 0, "error positions are not supported");
+        traces.push(text(wire::read_string(host, wire::MAX_HOST_STRING).await?));
+    }
+    if !traces.is_empty() {
+        message.push_str("; traces: ");
+        message.push_str(&traces.join(" | "));
+    }
+    Ok(message)
+}
+
+fn text(raw: Vec<u8>) -> String {
+    String::from_utf8_lossy(&raw).into_owned()
+}
+
 /// Typed logger fields (worker-protocol-connection.cc readFields).
 async fn copy_fields<R, W>(host: &mut R, guest: &mut W) -> Result<()>
 where
@@ -107,6 +198,27 @@ where
                 wire::copy_u64(host, guest).await?;
             }
             1 => wire::copy_string(host, guest, wire::MAX_HOST_STRING).await?,
+            t => bail!("unsupported logger field type {t}"),
+        }
+    }
+    Ok(())
+}
+
+async fn drain_fields<R>(host: &mut R, logs: &mut Vec<String>) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+{
+    let count = wire::read_u64(host).await?;
+    ensure!(
+        count <= wire::MAX_COUNT,
+        "field count {count} exceeds limit"
+    );
+    for _ in 0..count {
+        match wire::read_u64(host).await? {
+            0 => {
+                wire::read_u64(host).await?;
+            }
+            1 => push_log(logs, wire::read_string(host, wire::MAX_HOST_STRING).await?),
             t => bail!("unsupported logger field type {t}"),
         }
     }

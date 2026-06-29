@@ -254,7 +254,7 @@ mod tests {
         ] {
             assert_eq!(Op::allowed(word).unwrap().name(), name);
         }
-        for word in [0, 7, 9, 11, 38, 40, 44, 48, u64::MAX] {
+        for word in [0, 7, 9, 10, 11, 38, 40, 44, 48, u64::MAX] {
             assert_eq!(Op::allowed(word), None, "op {word} must not be allowed");
         }
     }
