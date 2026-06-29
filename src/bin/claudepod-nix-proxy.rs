@@ -71,7 +71,7 @@ async fn run(args: Args, listener: StdUnixListener, socket_path: Option<PathBuf>
         bail!("parent {} died before proxy startup", args.parent_pid);
     }
 
-    let _nix_run_roots = args
+    let nix_run_roots = args
         .nix_run_roots
         .as_deref()
         .map(claudepod::proxy::NixRunRoots::load)
@@ -86,7 +86,7 @@ async fn run(args: Args, listener: StdUnixListener, socket_path: Option<PathBuf>
         socket_path.map(|path| Box::new(move || unlink(&path)) as Box<dyn FnOnce() + Send>);
 
     tokio::select! {
-        result = claudepod::proxy::serve(listener, args.upstream, on_first_accept) => result,
+        result = claudepod::proxy::serve_with_run_roots(listener, args.upstream, nix_run_roots, on_first_accept) => result,
         _ = sigterm.recv() => Ok(()),
         _ = sigint.recv() => Ok(()),
     }

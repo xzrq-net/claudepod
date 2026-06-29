@@ -1,13 +1,17 @@
 //! Per-connection relay state machine: handshakes, post-handshake exchange,
 //! then the op loop.
 
+use std::ffi::OsStr;
 use std::future::Future;
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
 
-use super::{handshake, ops, stderr, wire};
+use super::{NixRunRoots, handshake, ops, stderr, wire};
 
 /// A healthy guest streams continuously through handshake steps and op
 /// arguments; only at op boundaries may a (pooled) connection idle, so
@@ -19,14 +23,19 @@ const ARGS_TIMEOUT: Duration = Duration::from_secs(60);
 /// guest hangs up or a protocol violation kills the session. `connect`
 /// dials the host daemon; it runs only after the guest has sent valid
 /// protocol magic, so a stalling client never costs the host a daemon fork.
-pub async fn run<GR, GW, HR, HW, C, F>(guest_r: GR, guest_w: GW, connect: C) -> Result<()>
+pub async fn run<HR, HW, ConnectFut, FillFut>(
+    guest_r: impl AsyncRead + Unpin,
+    guest_w: impl AsyncWrite + Unpin,
+    connect: impl FnOnce() -> ConnectFut,
+    nix_run_roots: Option<Arc<NixRunRoots>>,
+    fill: impl Fn(PathBuf) -> FillFut,
+    warn: impl Fn(String),
+) -> Result<()>
 where
-    GR: AsyncRead + Unpin,
-    GW: AsyncWrite + Unpin,
     HR: AsyncRead + Unpin,
     HW: AsyncWrite + Unpin,
-    C: FnOnce() -> F,
-    F: Future<Output = Result<(HR, HW)>>,
+    ConnectFut: Future<Output = Result<(HR, HW)>>,
+    FillFut: Future<Output = Result<()>>,
 {
     let mut gr = BufReader::new(guest_r);
     let mut gw = BufWriter::new(guest_w);
@@ -98,6 +107,21 @@ where
         }
 
         wire::write_u64(&mut hw, word).await?;
+        if op == ops::Op::IsValidPath {
+            intercept_is_valid_path(
+                nix_run_roots.as_deref(),
+                &fill,
+                &warn,
+                &mut gr,
+                &mut hr,
+                &mut hw,
+                &mut gw,
+            )
+            .await?;
+            gw.flush().await?;
+            continue;
+        }
+
         relay_args(op, &negotiated, &mut gr, &mut hw, &mut gw).await?;
         hw.flush().await?;
 
@@ -119,21 +143,141 @@ where
     }
 }
 
+async fn intercept_is_valid_path<FillFut>(
+    nix_run_roots: Option<&NixRunRoots>,
+    fill: &impl Fn(PathBuf) -> FillFut,
+    warn: &impl Fn(String),
+    guest_r: &mut (impl AsyncRead + Unpin),
+    host_r: &mut (impl AsyncRead + Unpin),
+    host_w: &mut (impl AsyncWrite + Unpin),
+    guest_w: &mut (impl AsyncWrite + Unpin),
+) -> Result<()>
+where
+    FillFut: Future<Output = Result<()>>,
+{
+    let store_path = relay_is_valid_path_args(guest_r, host_w, guest_w).await?;
+    host_w.flush().await?;
+
+    let terminal = stderr::relay_without_last(host_r, guest_w)
+        .await
+        .context("IsValidPath stderr")?;
+    if terminal == stderr::Terminal::Error {
+        return Ok(());
+    }
+
+    let host_valid = wire::read_u64(host_r).await.context("IsValidPath result")? != 0;
+    if host_valid {
+        write_is_valid_path_result(guest_w, true).await?;
+        return Ok(());
+    }
+
+    if !nix_run_roots.is_some_and(|roots| roots.contains(&store_path)) {
+        write_is_valid_path_result(guest_w, false).await?;
+        return Ok(());
+    }
+
+    if let Err(err) = fill(store_path.clone()).await {
+        warn_on_demand_fill(warn, &store_path, format!("fill failed: {err:#}"));
+        write_is_valid_path_result(guest_w, false).await?;
+        return Ok(());
+    }
+
+    match recheck_is_valid_path(host_r, host_w, &store_path).await? {
+        Recheck::Valid => write_is_valid_path_result(guest_w, true).await?,
+        Recheck::Invalid => {
+            warn_on_demand_fill(warn, &store_path, "re-check still invalid".to_string());
+            write_is_valid_path_result(guest_w, false).await?;
+        }
+        Recheck::DaemonError(message) => {
+            warn_on_demand_fill(warn, &store_path, format!("re-check failed: {message}"));
+            write_is_valid_path_result(guest_w, false).await?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn relay_is_valid_path_args(
+    guest_r: &mut (impl AsyncRead + Unpin),
+    host_w: &mut (impl AsyncWrite + Unpin),
+    guest_w: &mut (impl AsyncWrite + Unpin),
+) -> Result<PathBuf> {
+    match within(ARGS_TIMEOUT, async {
+        let raw = wire::read_string(guest_r, wire::MAX_GUEST_STRING).await?;
+        wire::write_string(host_w, &raw).await?;
+        Ok(PathBuf::from(OsStr::from_bytes(&raw)))
+    })
+    .await
+    {
+        Ok(path) => Ok(path),
+        Err(err) => {
+            let err = err.context("IsValidPath arguments");
+            let _ = stderr::write_error(guest_w, &format!("{err:#}")).await;
+            Err(err)
+        }
+    }
+}
+
+enum Recheck {
+    Valid,
+    Invalid,
+    DaemonError(String),
+}
+
+async fn recheck_is_valid_path(
+    host_r: &mut (impl AsyncRead + Unpin),
+    host_w: &mut (impl AsyncWrite + Unpin),
+    store_path: &Path,
+) -> Result<Recheck> {
+    wire::write_u64(host_w, ops::Op::IsValidPath as u64).await?;
+    wire::write_string(host_w, store_path.as_os_str().as_bytes()).await?;
+    host_w.flush().await?;
+
+    match stderr::drain_to_terminal(host_r)
+        .await
+        .context("IsValidPath re-check stderr")?
+    {
+        stderr::Drained::Last => {
+            let valid = wire::read_u64(host_r)
+                .await
+                .context("IsValidPath re-check result")?
+                != 0;
+            Ok(if valid {
+                Recheck::Valid
+            } else {
+                Recheck::Invalid
+            })
+        }
+        stderr::Drained::Error(message) => Ok(Recheck::DaemonError(message)),
+    }
+}
+
+async fn write_is_valid_path_result(
+    guest_w: &mut (impl AsyncWrite + Unpin),
+    valid: bool,
+) -> Result<()> {
+    wire::write_u64(guest_w, stderr::STDERR_LAST).await?;
+    wire::write_u64(guest_w, u64::from(valid)).await?;
+    Ok(())
+}
+
+fn warn_on_demand_fill(warn: &impl Fn(String), store_path: &Path, reason: String) {
+    warn(format!(
+        "claudepod-nix-proxy: warning: on-demand fill for {}: {reason}",
+        store_path.display()
+    ));
+}
+
 /// Copy an op's arguments guest-to-`dest` under the args timeout. On
 /// failure, nothing has been sent guestward for this op yet, so the guest
 /// still gets a parseable synthetic error before the session dies.
-async fn relay_args<R, W, G>(
+async fn relay_args(
     op: ops::Op,
     negotiated: &handshake::Negotiated,
-    guest: &mut R,
-    dest: &mut W,
-    guest_w: &mut G,
-) -> Result<()>
-where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
-    G: AsyncWrite + Unpin,
-{
+    guest: &mut (impl AsyncRead + Unpin),
+    dest: &mut (impl AsyncWrite + Unpin),
+    guest_w: &mut (impl AsyncWrite + Unpin),
+) -> Result<()> {
     match within(ARGS_TIMEOUT, ops::copy_args(op, negotiated, guest, dest)).await {
         Ok(()) => Ok(()),
         Err(err) => {
@@ -154,13 +298,19 @@ async fn within<T>(limit: Duration, fut: impl Future<Output = Result<T>>) -> Res
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
     use super::*;
     use crate::proxy::handshake::{WORKER_MAGIC_1, WORKER_MAGIC_2};
     use crate::proxy::testutil::{put_str, put_u64};
 
     const VERSION_1_38: u64 = 0x126;
 
-    /// Everything the guest sends, through one IsValidPath op.
+    const STORE_PATH: &[u8] = b"/nix/store/aaa111-one";
+    const OTHER_STORE_PATH: &[u8] = b"/nix/store/bbb222-two";
+
+    /// Everything the guest sends before the op loop.
     fn guest_script() -> Vec<u8> {
         let mut buf = Vec::new();
         put_u64(&mut buf, WORKER_MAGIC_1);
@@ -184,53 +334,325 @@ mod tests {
         buf
     }
 
+    fn put_is_valid_path(buf: &mut Vec<u8>, path: &[u8]) {
+        put_u64(buf, ops::Op::IsValidPath as u64);
+        put_str(buf, path);
+    }
+
+    fn put_is_valid_path_result(buf: &mut Vec<u8>, valid: bool) {
+        put_u64(buf, stderr::STDERR_LAST);
+        put_u64(buf, u64::from(valid));
+    }
+
+    fn put_daemon_error(buf: &mut Vec<u8>, msg: &[u8]) {
+        put_u64(buf, stderr::STDERR_ERROR);
+        put_str(buf, b"Error");
+        put_u64(buf, 0);
+        put_str(buf, b"Error");
+        put_str(buf, msg);
+        put_u64(buf, 0); // no position
+        put_u64(buf, 0); // no traces
+    }
+
     async fn run_session(guest_in: &[u8], host_in: &[u8]) -> (Result<()>, Vec<u8>, Vec<u8>) {
-        let mut guest_out = Vec::new();
-        let mut host_out = Vec::new();
-        let result = run(&mut &guest_in[..], &mut guest_out, || async {
-            Ok((host_in, &mut host_out))
-        })
-        .await;
+        let (result, guest_out, host_out, _, _) =
+            run_session_with_fill(guest_in, host_in, None, []).await;
         (result, guest_out, host_out)
     }
 
+    async fn run_session_with_roots(
+        guest_in: &[u8],
+        host_in: &[u8],
+        roots: &[&[u8]],
+    ) -> (Result<()>, Vec<u8>, Vec<u8>, Vec<PathBuf>, Vec<String>) {
+        let roots = roots
+            .iter()
+            .map(|path| PathBuf::from(OsStr::from_bytes(path)));
+        run_session_with_fill(
+            guest_in,
+            host_in,
+            Some(Arc::new(NixRunRoots::from_paths(roots))),
+            [],
+        )
+        .await
+    }
+
+    async fn run_session_with_fill<const N: usize>(
+        guest_in: &[u8],
+        host_in: &[u8],
+        roots: Option<Arc<NixRunRoots>>,
+        fill_results: [&str; N],
+    ) -> (Result<()>, Vec<u8>, Vec<u8>, Vec<PathBuf>, Vec<String>) {
+        let mut guest_out = Vec::new();
+        let mut host_out = Vec::new();
+        let fills = Arc::new(Mutex::new(Vec::new()));
+        let fill_results = Arc::new(Mutex::new(VecDeque::from(fill_results.map(str::to_owned))));
+        let warnings = Arc::new(Mutex::new(Vec::new()));
+
+        let fill_fills = fills.clone();
+        let fill_results_for_hook = fill_results.clone();
+        let warn_warnings = warnings.clone();
+        let result = run(
+            &mut &guest_in[..],
+            &mut guest_out,
+            || async { Ok((host_in, &mut host_out)) },
+            roots,
+            move |store_path| {
+                let fills = fill_fills.clone();
+                let fill_results = fill_results_for_hook.clone();
+                async move {
+                    fills.lock().unwrap().push(store_path);
+                    let Some(result) = fill_results.lock().unwrap().pop_front() else {
+                        anyhow::bail!("unexpected fill");
+                    };
+                    if result.is_empty() {
+                        Ok(())
+                    } else {
+                        anyhow::bail!("{result}");
+                    }
+                }
+            },
+            move |message| warn_warnings.lock().unwrap().push(message),
+        )
+        .await;
+        let fills = fills.lock().unwrap().clone();
+        let warnings = warnings.lock().unwrap().clone();
+        (result, guest_out, host_out, fills, warnings)
+    }
+
+    fn expected_host_with_is_valid_path_ops(paths: &[&[u8]]) -> Vec<u8> {
+        let mut expected = Vec::new();
+        put_u64(&mut expected, WORKER_MAGIC_1);
+        put_u64(&mut expected, VERSION_1_38);
+        put_u64(&mut expected, 0); // our (empty) feature list
+        put_u64(&mut expected, 0); // obsolete CPU affinity
+        put_u64(&mut expected, 0); // obsolete reserveSpace
+        for path in paths {
+            put_is_valid_path(&mut expected, path);
+        }
+        expected
+    }
+
+    fn expected_guest_prefix() -> Vec<u8> {
+        let mut expected = Vec::new();
+        put_u64(&mut expected, WORKER_MAGIC_2);
+        put_u64(&mut expected, VERSION_1_38);
+        put_u64(&mut expected, 0); // negotiated (empty) feature list
+        put_str(&mut expected, b"2.34.7");
+        put_u64(&mut expected, 2);
+        put_u64(&mut expected, stderr::STDERR_LAST); // greeting
+        expected
+    }
+
     #[tokio::test]
-    async fn full_session_is_valid_path() {
+    async fn is_valid_path_host_valid_pass_through() {
         let mut guest_in = guest_script();
-        put_u64(&mut guest_in, 1); // IsValidPath
-        put_str(&mut guest_in, b"/nix/store/abc-foo");
+        put_is_valid_path(&mut guest_in, STORE_PATH);
         // Guest EOF after the op: clean shutdown.
 
         let mut host_in = host_script();
-        put_u64(&mut host_in, stderr::STDERR_LAST);
-        put_u64(&mut host_in, 1); // result: valid
+        put_is_valid_path_result(&mut host_in, true);
 
         let (result, guest_out, host_out) = run_session(&guest_in, &host_in).await;
         result.unwrap();
 
-        // Toward the host: our handshake, relayed post-handshake fields,
-        // relayed op.
-        let mut expected_host = Vec::new();
-        put_u64(&mut expected_host, WORKER_MAGIC_1);
-        put_u64(&mut expected_host, VERSION_1_38);
-        put_u64(&mut expected_host, 0); // our (empty) feature list
-        put_u64(&mut expected_host, 0);
-        put_u64(&mut expected_host, 0);
-        put_u64(&mut expected_host, 1);
-        put_str(&mut expected_host, b"/nix/store/abc-foo");
-        assert_eq!(host_out, expected_host);
+        assert_eq!(
+            host_out,
+            expected_host_with_is_valid_path_ops(&[STORE_PATH])
+        );
 
         // Toward the guest: our handshake, relayed greeting, relayed result.
-        let mut expected_guest = Vec::new();
-        put_u64(&mut expected_guest, WORKER_MAGIC_2);
-        put_u64(&mut expected_guest, VERSION_1_38);
-        put_u64(&mut expected_guest, 0); // negotiated (empty) feature list
-        put_str(&mut expected_guest, b"2.34.7");
-        put_u64(&mut expected_guest, 2);
-        put_u64(&mut expected_guest, stderr::STDERR_LAST);
-        put_u64(&mut expected_guest, stderr::STDERR_LAST);
-        put_u64(&mut expected_guest, 1);
+        let mut expected_guest = expected_guest_prefix();
+        put_is_valid_path_result(&mut expected_guest, true);
         assert_eq!(guest_out, expected_guest);
+    }
+
+    #[tokio::test]
+    async fn is_valid_path_host_invalid_manifest_miss_returns_false() {
+        let mut guest_in = guest_script();
+        put_is_valid_path(&mut guest_in, STORE_PATH);
+
+        let mut host_in = host_script();
+        put_is_valid_path_result(&mut host_in, false);
+
+        let (result, guest_out, host_out, fills, warnings) =
+            run_session_with_roots(&guest_in, &host_in, &[OTHER_STORE_PATH]).await;
+        result.unwrap();
+
+        assert_eq!(
+            host_out,
+            expected_host_with_is_valid_path_ops(&[STORE_PATH])
+        );
+        let mut expected_guest = expected_guest_prefix();
+        put_is_valid_path_result(&mut expected_guest, false);
+        assert_eq!(guest_out, expected_guest);
+        assert!(fills.is_empty());
+        assert!(warnings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn is_valid_path_daemon_error_is_relayed_without_fill() {
+        let mut guest_in = guest_script();
+        put_is_valid_path(&mut guest_in, STORE_PATH);
+
+        let mut host_in = host_script();
+        put_daemon_error(&mut host_in, b"daemon-side failure");
+
+        let roots = Some(Arc::new(NixRunRoots::from_paths([PathBuf::from(
+            OsStr::from_bytes(STORE_PATH),
+        )])));
+        let (result, guest_out, _, fills, warnings) =
+            run_session_with_fill(&guest_in, &host_in, roots, []).await;
+        result.unwrap();
+
+        let mut expected_guest = expected_guest_prefix();
+        put_daemon_error(&mut expected_guest, b"daemon-side failure");
+        assert_eq!(guest_out, expected_guest);
+        assert!(fills.is_empty());
+        assert!(warnings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn is_valid_path_manifest_hit_fill_success_recheck_valid_returns_true() {
+        let mut guest_in = guest_script();
+        put_is_valid_path(&mut guest_in, STORE_PATH);
+
+        let mut host_in = host_script();
+        put_is_valid_path_result(&mut host_in, false);
+        put_is_valid_path_result(&mut host_in, true);
+
+        let roots = Some(Arc::new(NixRunRoots::from_paths([PathBuf::from(
+            OsStr::from_bytes(STORE_PATH),
+        )])));
+        let (result, guest_out, host_out, fills, warnings) =
+            run_session_with_fill(&guest_in, &host_in, roots, [""]).await;
+        result.unwrap();
+
+        assert_eq!(
+            host_out,
+            expected_host_with_is_valid_path_ops(&[STORE_PATH, STORE_PATH])
+        );
+        let mut expected_guest = expected_guest_prefix();
+        put_is_valid_path_result(&mut expected_guest, true);
+        assert_eq!(guest_out, expected_guest);
+        assert_eq!(fills, [PathBuf::from(OsStr::from_bytes(STORE_PATH))]);
+        assert!(warnings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn is_valid_path_fill_failure_returns_false_and_warns() {
+        let mut guest_in = guest_script();
+        put_is_valid_path(&mut guest_in, STORE_PATH);
+
+        let mut host_in = host_script();
+        put_is_valid_path_result(&mut host_in, false);
+
+        let roots = Some(Arc::new(NixRunRoots::from_paths([PathBuf::from(
+            OsStr::from_bytes(STORE_PATH),
+        )])));
+        let (result, guest_out, host_out, fills, warnings) =
+            run_session_with_fill(&guest_in, &host_in, roots, ["substitution failed"]).await;
+        result.unwrap();
+
+        assert_eq!(
+            host_out,
+            expected_host_with_is_valid_path_ops(&[STORE_PATH])
+        );
+        let mut expected_guest = expected_guest_prefix();
+        put_is_valid_path_result(&mut expected_guest, false);
+        assert_eq!(guest_out, expected_guest);
+        assert_eq!(fills, [PathBuf::from(OsStr::from_bytes(STORE_PATH))]);
+        assert_eq!(warnings.len(), 1);
+        assert!(
+            warnings[0].contains("/nix/store/aaa111-one"),
+            "{warnings:?}"
+        );
+        assert!(warnings[0].contains("substitution failed"), "{warnings:?}");
+    }
+
+    #[tokio::test]
+    async fn is_valid_path_fill_success_recheck_invalid_returns_false_and_warns() {
+        let mut guest_in = guest_script();
+        put_is_valid_path(&mut guest_in, STORE_PATH);
+
+        let mut host_in = host_script();
+        put_is_valid_path_result(&mut host_in, false);
+        put_is_valid_path_result(&mut host_in, false);
+
+        let roots = Some(Arc::new(NixRunRoots::from_paths([PathBuf::from(
+            OsStr::from_bytes(STORE_PATH),
+        )])));
+        let (result, guest_out, host_out, fills, warnings) =
+            run_session_with_fill(&guest_in, &host_in, roots, [""]).await;
+        result.unwrap();
+
+        assert_eq!(
+            host_out,
+            expected_host_with_is_valid_path_ops(&[STORE_PATH, STORE_PATH])
+        );
+        let mut expected_guest = expected_guest_prefix();
+        put_is_valid_path_result(&mut expected_guest, false);
+        assert_eq!(guest_out, expected_guest);
+        assert_eq!(fills, [PathBuf::from(OsStr::from_bytes(STORE_PATH))]);
+        assert_eq!(warnings.len(), 1);
+        assert!(
+            warnings[0].contains("/nix/store/aaa111-one"),
+            "{warnings:?}"
+        );
+        assert!(warnings[0].contains("still invalid"), "{warnings:?}");
+    }
+
+    #[tokio::test]
+    async fn is_valid_path_recheck_protocol_error_fails_session() {
+        let mut guest_in = guest_script();
+        put_is_valid_path(&mut guest_in, STORE_PATH);
+
+        let mut host_in = host_script();
+        put_is_valid_path_result(&mut host_in, false);
+        put_u64(&mut host_in, 0xdead_beef);
+
+        let roots = Some(Arc::new(NixRunRoots::from_paths([PathBuf::from(
+            OsStr::from_bytes(STORE_PATH),
+        )])));
+        let (result, guest_out, host_out, fills, warnings) =
+            run_session_with_fill(&guest_in, &host_in, roots, [""]).await;
+        let err = result.unwrap_err();
+        let err = format!("{err:#}");
+
+        assert!(err.contains("unknown stderr message"), "{err}");
+        assert_eq!(
+            host_out,
+            expected_host_with_is_valid_path_ops(&[STORE_PATH, STORE_PATH])
+        );
+        assert_eq!(guest_out, expected_guest_prefix());
+        assert_eq!(fills, [PathBuf::from(OsStr::from_bytes(STORE_PATH))]);
+        assert!(warnings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn intercepted_is_valid_path_emits_one_terminal_marker() {
+        let mut guest_in = guest_script();
+        put_is_valid_path(&mut guest_in, STORE_PATH);
+
+        let mut host_in = host_script();
+        put_u64(&mut host_in, stderr::STDERR_NEXT);
+        put_str(&mut host_in, b"initial invalid check\n");
+        put_is_valid_path_result(&mut host_in, false);
+        put_is_valid_path_result(&mut host_in, true);
+
+        let roots = Some(Arc::new(NixRunRoots::from_paths([PathBuf::from(
+            OsStr::from_bytes(STORE_PATH),
+        )])));
+        let (result, guest_out, _, _, warnings) =
+            run_session_with_fill(&guest_in, &host_in, roots, [""]).await;
+        result.unwrap();
+
+        let mut expected_guest = expected_guest_prefix();
+        put_u64(&mut expected_guest, stderr::STDERR_NEXT);
+        put_str(&mut expected_guest, b"initial invalid check\n");
+        put_is_valid_path_result(&mut expected_guest, true);
+        assert_eq!(guest_out, expected_guest);
+        assert!(warnings.is_empty());
     }
 
     #[tokio::test]

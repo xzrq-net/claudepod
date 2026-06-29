@@ -36,9 +36,19 @@ const MAX_SESSIONS: usize = 32;
 pub async fn serve(
     listener: UnixListener,
     upstream: PathBuf,
+    on_first_accept: Option<Box<dyn FnOnce() + Send>>,
+) -> Result<()> {
+    serve_with_run_roots(listener, upstream, None, on_first_accept).await
+}
+
+pub async fn serve_with_run_roots(
+    listener: UnixListener,
+    upstream: PathBuf,
+    nix_run_roots: Option<NixRunRoots>,
     mut on_first_accept: Option<Box<dyn FnOnce() + Send>>,
 ) -> Result<()> {
     let limiter = Arc::new(Semaphore::new(MAX_SESSIONS));
+    let nix_run_roots = nix_run_roots.map(Arc::new);
     loop {
         // Backpressure before accept: at capacity, new connections wait in
         // the kernel backlog where they cost this process no fds; once the
@@ -61,21 +71,40 @@ pub async fn serve(
             hook();
         }
         let upstream = upstream.clone();
+        let nix_run_roots = nix_run_roots.clone();
         tokio::spawn(async move {
             let _permit = permit;
-            if let Err(err) = relay(guest, &upstream).await {
+            if let Err(err) = relay(guest, &upstream, nix_run_roots).await {
                 eprintln!("claudepod-nix-proxy: session failed: {err:#}");
             }
         });
     }
 }
 
-async fn relay(guest: UnixStream, upstream: &Path) -> Result<()> {
+async fn relay(
+    guest: UnixStream,
+    upstream: &Path,
+    nix_run_roots: Option<Arc<NixRunRoots>>,
+) -> Result<()> {
     let (guest_r, guest_w) = guest.into_split();
-    session::run(guest_r, guest_w, || async {
-        let host = UnixStream::connect(upstream).await?;
-        Ok(host.into_split())
-    })
+    let connect_upstream = upstream.to_path_buf();
+    let fill_upstream = connect_upstream.clone();
+    session::run(
+        guest_r,
+        guest_w,
+        || async {
+            let host = UnixStream::connect(&connect_upstream).await?;
+            Ok(host.into_split())
+        },
+        nix_run_roots,
+        move |store_path| {
+            let upstream = fill_upstream.clone();
+            async move { host_client::ensure_path(&upstream, &store_path).await }
+        },
+        |message| {
+            eprintln!("{message}");
+        },
+    )
     .await
 }
 

@@ -21,6 +21,13 @@ impl NixRunRoots {
     pub fn contains(&self, path: &Path) -> bool {
         self.paths.contains(path)
     }
+
+    #[cfg(test)]
+    pub(crate) fn from_paths(paths: impl IntoIterator<Item = PathBuf>) -> Self {
+        NixRunRoots {
+            paths: paths.into_iter().collect(),
+        }
+    }
 }
 
 fn parse_manifest(raw: &[u8]) -> Result<NixRunRoots> {

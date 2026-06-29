@@ -27,8 +27,36 @@ pub enum Terminal {
     Error,
 }
 
+/// Stderr drained without relaying. `Error` means the daemon sent a
+/// structured `STDERR_ERROR` and the connection is still at an op boundary.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Drained {
+    Last,
+    Error(String),
+}
+
 /// Relay stderr messages host-to-guest until a terminal message.
 pub async fn relay<R, W>(host: &mut R, guest: &mut W) -> Result<Terminal>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    relay_inner(host, guest, true).await
+}
+
+/// Relay stderr messages host-to-guest until a terminal message, but hold
+/// back `STDERR_LAST`. Used when the proxy must inspect the result payload
+/// before deciding what final result to send to the guest. `STDERR_ERROR`
+/// is still relayed exactly.
+pub async fn relay_without_last<R, W>(host: &mut R, guest: &mut W) -> Result<Terminal>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    relay_inner(host, guest, false).await
+}
+
+async fn relay_inner<R, W>(host: &mut R, guest: &mut W, forward_last: bool) -> Result<Terminal>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -39,7 +67,9 @@ where
         let msg = wire::read_u64(host).await?;
         match msg {
             STDERR_LAST => {
-                wire::write_u64(guest, msg).await?;
+                if forward_last {
+                    wire::write_u64(guest, msg).await?;
+                }
                 return Ok(Terminal::Last);
             }
             STDERR_ERROR => {
@@ -97,18 +127,28 @@ pub async fn drain_to_last<R>(host: &mut R) -> Result<()>
 where
     R: AsyncRead + Unpin,
 {
+    match drain_to_terminal(host).await? {
+        Drained::Last => Ok(()),
+        Drained::Error(message) => bail!("{message}"),
+    }
+}
+
+pub async fn drain_to_terminal<R>(host: &mut R) -> Result<Drained>
+where
+    R: AsyncRead + Unpin,
+{
     let mut logs = Vec::new();
     loop {
         let msg = wire::read_u64(host).await?;
         match msg {
-            STDERR_LAST => return Ok(()),
+            STDERR_LAST => return Ok(Drained::Last),
             STDERR_ERROR => {
                 let mut message = read_error_message(host).await?;
                 if !logs.is_empty() {
                     message.push_str("; logs: ");
                     message.push_str(&logs.join(" | "));
                 }
-                bail!("{message}");
+                return Ok(Drained::Error(message));
             }
             STDERR_NEXT => {
                 let text = wire::read_string(host, wire::MAX_HOST_STRING).await?;
