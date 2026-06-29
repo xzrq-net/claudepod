@@ -50,24 +50,16 @@ async fn reexec_under_unshare() -> Result<()> {
 }
 
 struct Env {
-    /// Logical store dir, shared by every store in the test. Also the host
-    /// store's physical dir.
-    store: PathBuf,
     home: PathBuf,
     conf: PathBuf,
-    host_state: PathBuf,
+    host_root: PathBuf,
+    host_store: PathBuf,
     host_socket: PathBuf,
     proxy_socket: PathBuf,
+    guest_root: PathBuf,
+    guest_store: PathBuf,
     guest_upper: PathBuf,
-    guest_state: PathBuf,
     guest_socket: PathBuf,
-    /// Wrapper script that enters the "container" view: a mount namespace
-    /// with the merged overlay bound over the logical store dir, mirroring
-    /// the real setup where the container sees the merged store at
-    /// /nix/store. Everything guest-side (daemon, clients, builders) must
-    /// run under it — nix clients are LocalFSStores that read store files
-    /// directly at the logical path.
-    guest_ns: PathBuf,
 }
 
 /// Run the named `Fixture` test methods in order, stopping at the first failure.
@@ -113,7 +105,7 @@ impl Fixture {
         step("start host nix-daemon");
         let host_daemon = env
             .spawn_daemon(
-                env.nix_cmd("nix-daemon", &env.host_state, "local"),
+                env.daemon_cmd("nix-daemon", &env.host_store_uri(), &env.host_socket),
                 &env.host_socket,
             )
             .await?;
@@ -122,18 +114,14 @@ impl Fixture {
         let seed = env.home.join("seed");
         std::fs::write(&seed, "claudepod e2e seed\n")?;
         let out = run_cmd(
-            env.nix_cmd(
-                "nix-store",
-                &env.host_state,
-                &format!("unix://{}", env.host_socket.display()),
-            )
-            .arg("--add")
-            .arg(&seed),
+            env.nix_cmd("nix-store", &env.host_daemon_uri())
+                .arg("--add")
+                .arg(&seed),
         )
         .await?;
         let host_path = out.trim().to_owned();
         ensure!(
-            Path::new(&host_path).exists(),
+            env.host_physical_path(&host_path)?.exists(),
             "seed path {host_path} missing from host store"
         );
         eprintln!("seeded {host_path}");
@@ -148,18 +136,9 @@ impl Fixture {
         });
 
         step("start guest nix-daemon");
-        // No root/real params: inside the guest namespace the merged
-        // overlay shadows the logical store dir, so the real store is the
-        // logical store — same as the real container, where the merged
-        // store sits at /nix/store.
-        let guest_store_uri = format!(
-            "local-overlay://?upper-layer={}&check-mount=false&lower-store={}",
-            env.guest_upper.display(),
-            urlencode(&format!("unix://{}", env.proxy_socket.display())),
-        );
         let guest_daemon = env
             .spawn_daemon(
-                env.guest_ns_cmd("nix-daemon", &env.guest_state, &guest_store_uri),
+                env.daemon_cmd("nix-daemon", &env.guest_store_uri(), &env.guest_socket),
                 &env.guest_socket,
             )
             .await?;
@@ -172,23 +151,17 @@ impl Fixture {
         })
     }
 
-    /// Client command against the guest daemon, run inside the guest mount
-    /// namespace like everything else guest-side.
+    /// Client command against the guest daemon. The unix store URI carries
+    /// `root=` so clients that stat realized paths use the rooted physical
+    /// store, while operations still flow through the daemon/proxy chain.
     fn guest_cmd(&self, program: &str) -> Command {
-        self.env.guest_ns_cmd(
-            program,
-            &self.env.guest_state,
-            &format!("unix://{}", self.env.guest_socket.display()),
-        )
+        self.env.nix_cmd(program, &self.env.guest_daemon_uri())
     }
 
-    /// Client command against the host daemon.
+    /// Client command against the host daemon, with the same rooted physical
+    /// store mapping as the daemon.
     fn host_cmd(&self, program: &str) -> Command {
-        self.env.nix_cmd(
-            program,
-            &self.env.host_state,
-            &format!("unix://{}", self.env.host_socket.display()),
-        )
+        self.env.nix_cmd(program, &self.env.host_daemon_uri())
     }
 
     /// `nix-build` a one-echo derivation; returns the output path. `dep`
@@ -225,19 +198,14 @@ impl Fixture {
 
     /// Predict the store path `nix-store --add <file>` will produce without
     /// registering it anywhere the test stores can see: add it to a
-    /// throwaway local store sharing the logical store dir. Returns the
-    /// logical path and its physical location inside the throwaway store.
+    /// throwaway rooted local store. Returns the logical path and its
+    /// physical location inside the throwaway store.
     async fn predict_add_path(&self, file: &Path, tag: &str) -> Result<(String, PathBuf)> {
         let scratch = self.env.home.join(format!("scratch-{tag}"));
-        let state = scratch.join("var/nix");
-        std::fs::create_dir_all(&state)?;
+        std::fs::create_dir_all(&scratch)?;
         let out = run_cmd(
             self.env
-                .nix_cmd(
-                    "nix-store",
-                    &state,
-                    &format!("local://?root={}", scratch.display()),
-                )
+                .nix_cmd("nix-store", &format!("local://?root={}", scratch.display()))
                 .arg("--add")
                 .arg(file),
         )
@@ -246,9 +214,7 @@ impl Fixture {
         // With `root` set, the physical store is `<root>/nix/store`
         // regardless of the logical store dir (local-fs-store.hh
         // `realStoreDir`).
-        let physical = scratch
-            .join("nix/store")
-            .join(Path::new(&logical).file_name().unwrap());
+        let physical = physical_store_path(&scratch.join("nix/store"), &logical)?;
         ensure!(physical.exists(), "scratch store add left no file");
         Ok((logical, physical))
     }
@@ -408,7 +374,7 @@ impl Fixture {
         // The lower store survived: valid per the host db, files on disk.
         run_cmd(self.host_cmd("nix").args(["path-info", &self.host_path])).await?;
         ensure!(
-            Path::new(&self.host_path).exists(),
+            self.env.host_physical_path(&self.host_path)?.exists(),
             "guest gc deleted a lower store path from disk"
         );
         Ok(())
@@ -422,8 +388,8 @@ impl Fixture {
     /// store changes under a live container — which overlayfs treats as
     /// undefined behavior. Observed: the copy-up/unlink fails with EIO,
     /// i.e. the guest cannot self-repair this state. Pin that, and pin
-    /// what matters: the lower store is untouched and the guest daemon
-    /// survives. If a kernel change ever makes the reconcile succeed,
+    /// what matters: the lower store is untouched and the guest daemon still
+    /// serves queries. If a kernel change ever makes the reconcile succeed,
     /// this test fails loudly and the premise gets re-examined.
     async fn desync_repair(&self) -> Result<()> {
         // A directory, not a file: deletePath only chmods directories, and
@@ -439,7 +405,7 @@ impl Fixture {
             Command::new("cp")
                 .arg("-a")
                 .arg(&physical)
-                .arg(&self.env.store),
+                .arg(&self.env.host_store),
         )
         .await?;
         run_cmd_fail(self.guest_cmd("nix").args(["path-info", &predicted])).await?;
@@ -451,10 +417,12 @@ impl Fixture {
         );
 
         // The planted lower files are untouched, the path is still
-        // invalid, and the daemon still serves queries.
-        let base = Path::new(&predicted).file_name().unwrap();
+        // invalid, and the guest daemon still serves queries.
         ensure!(
-            self.env.store.join(base).join("inner").exists(),
+            self.env
+                .host_physical_path(&predicted)?
+                .join("inner")
+                .exists(),
             "failed repair damaged the lower store"
         );
         run_cmd_fail(self.guest_cmd("nix").args(["path-info", &predicted])).await?;
@@ -467,16 +435,16 @@ impl Env {
     fn setup() -> Result<Env> {
         let root = PathBuf::from("/tmp/claudepod-e2e");
         let env = Env {
-            store: root.join("store"),
             home: root.join("home"),
             conf: root.join("etc"),
-            host_state: root.join("host/var/nix"),
-            host_socket: root.join("host/var/nix/daemon-socket/socket"),
+            host_root: root.join("host/root"),
+            host_store: root.join("host/root/nix/store"),
+            host_socket: root.join("host/daemon-socket/socket"),
             proxy_socket: root.join("proxy.sock"),
+            guest_root: root.join("guest/root"),
+            guest_store: root.join("guest/root/nix/store"),
             guest_upper: root.join("guest/upper"),
-            guest_state: root.join("guest/var/nix"),
-            guest_socket: root.join("guest/var/nix/daemon-socket/socket"),
-            guest_ns: root.join("guest-ns.sh"),
+            guest_socket: root.join("guest/daemon-socket/socket"),
         };
 
         std::fs::create_dir_all(&root)?;
@@ -493,17 +461,16 @@ impl Env {
         // stands in for the `/nix/store:ro` volume in the real setup.
         let guest_lower = root.join("guest/lower");
         let guest_work = root.join("guest/work");
-        let guest_merged = root.join("guest/root/nix/store");
         for dir in [
-            &env.store,
             &env.home,
             &env.conf,
-            &env.host_state,
+            &env.host_store,
+            env.host_socket.parent().unwrap(),
             &guest_lower,
             &env.guest_upper,
             &guest_work,
-            &env.guest_state,
-            &guest_merged,
+            &env.guest_store,
+            env.guest_socket.parent().unwrap(),
         ] {
             std::fs::create_dir_all(dir)?;
         }
@@ -514,7 +481,6 @@ impl Env {
         std::fs::write(
             env.conf.join("nix.conf"),
             "experimental-features = nix-command local-overlay-store\n\
-             sandbox = false\n\
              build-users-group =\n\
              require-drop-supplementary-groups = false\n\
              substituters =\n\
@@ -522,7 +488,7 @@ impl Env {
         )?;
 
         mount(
-            Some(&env.store),
+            Some(&env.host_store),
             &guest_lower,
             None::<&str>,
             MsFlags::MS_BIND,
@@ -546,55 +512,68 @@ impl Env {
         );
         mount(
             Some("overlay"),
-            &guest_merged,
+            &env.guest_store,
             Some("overlay"),
             MsFlags::empty(),
             Some(overlay_opts.as_str()),
         )
         .context("mount overlayfs")?;
 
-        std::fs::write(
-            &env.guest_ns,
-            format!(
-                "#!/bin/sh\nset -e\nmount --bind {} {}\nexec \"$@\"\n",
-                guest_merged.display(),
-                env.store.display(),
-            ),
-        )?;
-        std::fs::set_permissions(
-            &env.guest_ns,
-            std::os::unix::fs::PermissionsExt::from_mode(0o755),
-        )?;
-
         Ok(env)
     }
 
-    /// Common nix process environment: clean slate, shared store dir and
-    /// config, per-side state dir and store URI.
-    fn nix_cmd(&self, program: &str, state: &Path, remote: &str) -> Command {
+    fn host_store_uri(&self) -> String {
+        format!("local://?root={}", self.host_root.display())
+    }
+
+    fn host_daemon_uri(&self) -> String {
+        format!(
+            "unix://{}?root={}",
+            self.host_socket.display(),
+            self.host_root.display()
+        )
+    }
+
+    fn guest_store_uri(&self) -> String {
+        format!(
+            "local-overlay://?root={}&upper-layer={}&lower-store={}&check-mount=false",
+            self.guest_root.display(),
+            self.guest_upper.display(),
+            urlencode(&format!("unix://{}", self.proxy_socket.display())),
+        )
+    }
+
+    fn guest_daemon_uri(&self) -> String {
+        format!(
+            "unix://{}?root={}",
+            self.guest_socket.display(),
+            self.guest_root.display()
+        )
+    }
+
+    /// Common nix process environment: clean slate, config, and store URI.
+    fn nix_cmd(&self, program: &str, remote: &str) -> Command {
         let mut cmd = Command::new(program);
-        self.apply_nix_env(&mut cmd, state, remote);
+        self.apply_nix_env(&mut cmd, remote);
         cmd
     }
 
-    /// Like `nix_cmd`, but run inside the guest mount namespace (see
-    /// `guest_ns`), where the merged overlay shadows the logical store dir.
-    fn guest_ns_cmd(&self, program: &str, state: &Path, remote: &str) -> Command {
-        let mut cmd = Command::new("unshare");
-        cmd.args(["--mount", "--"]).arg(&self.guest_ns).arg(program);
-        self.apply_nix_env(&mut cmd, state, remote);
+    fn daemon_cmd(&self, program: &str, remote: &str, socket: &Path) -> Command {
+        let mut cmd = self.nix_cmd(program, remote);
+        cmd.env("NIX_DAEMON_SOCKET_PATH", socket);
         cmd
     }
 
-    fn apply_nix_env(&self, cmd: &mut Command, state: &Path, remote: &str) {
+    fn host_physical_path(&self, logical: &str) -> Result<PathBuf> {
+        physical_store_path(&self.host_store, logical)
+    }
+
+    fn apply_nix_env(&self, cmd: &mut Command, remote: &str) {
         cmd.env_clear()
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("HOME", &self.home)
-            .env("NIX_STORE_DIR", &self.store)
             .env("NIX_CONF_DIR", &self.conf)
             .env("NIX_USER_CONF_FILES", "")
-            .env("NIX_STATE_DIR", state)
-            .env("NIX_LOG_DIR", state.join("log"))
             .env("NIX_REMOTE", remote);
     }
 
@@ -649,18 +628,43 @@ async fn run_cmd(cmd: &mut Command) -> Result<String> {
 
 fn fmt_cmd(cmd: &Command) -> String {
     let cmd = cmd.as_std();
-    let remote = cmd
-        .get_envs()
-        .find(|(name, _)| *name == "NIX_REMOTE")
-        .and_then(|(_, value)| value)
-        .map(|value| format!("NIX_REMOTE={} ", value.to_string_lossy()))
-        .unwrap_or_default();
+    let env = ["NIX_REMOTE", "NIX_DAEMON_SOCKET_PATH"]
+        .into_iter()
+        .filter_map(|key| {
+            cmd.get_envs()
+                .find(|(name, _)| *name == key)
+                .and_then(|(_, value)| value)
+                .map(|value| format!("{key}={}", value.to_string_lossy()))
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let env = if env.is_empty() {
+        String::new()
+    } else {
+        format!("{env} ")
+    };
     let argv = std::iter::once(cmd.get_program())
         .chain(cmd.get_args())
         .map(|arg| arg.to_string_lossy())
         .collect::<Vec<_>>()
         .join(" ");
-    format!("{remote}{argv}")
+    format!("{env}{argv}")
+}
+
+fn physical_store_path(store_dir: &Path, logical: &str) -> Result<PathBuf> {
+    let rel = Path::new(logical)
+        .strip_prefix("/nix/store")
+        .with_context(|| format!("{logical} is not under /nix/store"))?;
+    ensure!(
+        !rel.as_os_str().is_empty(),
+        "{logical} is the store dir, not a store path"
+    );
+    ensure!(
+        rel.components()
+            .all(|component| matches!(component, std::path::Component::Normal(_))),
+        "{logical} contains non-normal path components"
+    );
+    Ok(store_dir.join(rel))
 }
 
 fn urlencode(s: &str) -> String {
