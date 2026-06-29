@@ -19,10 +19,10 @@ Runtime shape:
 - The feature is optional. Normal `claudepod` startup must not evaluate all of
   nixpkgs, build the manifest, or fail when the manifest is absent.
 - Cache manifests under the host XDG cache dir, keyed by policy version, guest
-  system, pinned nixpkgs source hash, and guest toplevel hash, for example:
+  system, and pinned nixpkgs source hash, for example:
 
   ```text
-  $XDG_CACHE_HOME/claudepod/nix-run-roots/v1/<guest-system>/<nixpkgs-hash>/<toplevel-hash>.txt
+  $XDG_CACHE_HOME/claudepod/nix-run-roots/v1/<guest-system>/<nixpkgs-hash>.txt
   ```
 
 - If the cache file exists, `claudepod-start` passes it to
@@ -87,13 +87,12 @@ Pieces:
   launcher startup.
 
 - `claudepod-start` computes the expected cache path from policy version,
-  `CLAUDEPOD_GUEST_SYSTEM`, `CLAUDEPOD_NIXPKGS`, and the selected guest toplevel.
-  If the file exists, use it; if absent and `--build-nix-run-roots` was passed,
-  build it; if absent without the flag, print the disabled-feature message and
-  continue.
+  `CLAUDEPOD_GUEST_SYSTEM`, and `CLAUDEPOD_NIXPKGS`. If the file exists, use it;
+  if absent and `--build-nix-run-roots` was passed, build it; if absent without
+  the flag, print the disabled-feature message and continue.
 
 - `claudepod-start` passes the cache file path to `claudepod-nix-proxy`, e.g.
-  `--nix-run-roots $XDG_CACHE_HOME/claudepod/nix-run-roots/v1/<guest-system>/<nixpkgs-hash>/<toplevel-hash>.txt`.
+  `--nix-run-roots $XDG_CACHE_HOME/claudepod/nix-run-roots/v1/<guest-system>/<nixpkgs-hash>.txt`.
 
 - The proxy loads the manifest once at startup. A sorted `Vec<String>` or
   `HashSet<String>` is fine; this path count is not performance-critical. Store
@@ -146,9 +145,8 @@ Host fill primitive:
 
 Keying/caching:
 
-- Key the cache by manifest policy version, guest system, nixpkgs source hash,
-  and guest toplevel hash. Do not rely on the toplevel hash alone to imply the
-  exact nixpkgs package universe.
+- Key the cache by manifest policy version, guest system, and nixpkgs source
+  hash.
 - Include the manifest policy/config in the versioned key. Current policy config:
   `allowUnfree = true`, `allowAliases = false`, all top-level derivations whose
   output path can be evaluated.
@@ -194,9 +192,8 @@ Implementation slices:
    source, pinned nix binary, guest registry pin, and `allowUnfree = true`;
    `allowAliases = false` project/guest policy.
 2. Launcher/cache plumbing: XDG cache path, policy-versioned key
-   (`guest-system`/`nixpkgs-hash`/`toplevel-hash`), missing-cache message,
-   optional `--build-nix-run-roots` flag stub, and proxy arg only when a manifest
-   exists.
+   (`guest-system`/`nixpkgs-hash`), missing-cache message, optional
+   `--build-nix-run-roots` flag stub, and proxy arg only when a manifest exists.
 3. Manifest generator: opt-in command path that invokes pinned Nix, validates
    output shape, and atomically writes the cache file. This can land before the
    proxy consumes the manifest.

@@ -1,4 +1,6 @@
 use std::ffi::{OsStr, OsString};
+use std::fs::{File, OpenOptions};
+use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
@@ -20,6 +22,35 @@ const TIMEZONE_ENV: &str = "CLAUDEPOD_TIMEZONE";
 const STORE_LAYERS_FILE: &str = "/run/claudepod-store-layers";
 const TOPLEVEL_FILE: &str = "/run/claudepod-toplevel";
 const STORE_LAYER_MOUNT_DIR: &str = "/nix/.l";
+const NIX_RUN_ROOTS_EXPR: &str = r#"
+let
+  nixpkgs = /. + builtins.getEnv "CLAUDEPOD_NIXPKGS";
+  guestSystem = builtins.getEnv "CLAUDEPOD_GUEST_SYSTEM";
+  pkgs = import nixpkgs {
+    system = guestSystem;
+    config = {
+      allowUnfree = true;
+      allowAliases = false;
+    };
+  };
+  outputPathFor = name:
+    let
+      result = builtins.tryEval (
+        let value = pkgs.${name};
+        in if pkgs.lib.isDerivation value then toString value else null
+      );
+    in
+      if result.success && result.value != null
+      then [ (builtins.unsafeDiscardStringContext result.value) ]
+      else [];
+  paths = builtins.concatMap outputPathFor (builtins.attrNames pkgs);
+  sortedPaths = builtins.attrNames (builtins.listToAttrs (map (path: {
+    name = path;
+    value = true;
+  }) paths));
+in
+  if sortedPaths == [] then "" else builtins.concatStringsSep "\n" sortedPaths + "\n"
+"#;
 
 #[derive(Debug, Parser)]
 #[command(disable_version_flag = true, trailing_var_arg = true)]
@@ -110,7 +141,7 @@ fn main() -> Result<()> {
         .map(|idx| PathBuf::from(STORE_LAYER_MOUNT_DIR).join(idx.to_string()))
         .collect();
 
-    let nix_run_roots = nix_run_roots_manifest(&toplevel, args.build_nix_run_roots)?;
+    let nix_run_roots = nix_run_roots_manifest(args.build_nix_run_roots)?;
     let proxy_socket = spawn_nix_proxy(nix_run_roots.as_deref())?;
 
     let mut volumes = vec![
@@ -379,64 +410,219 @@ fn state_dir() -> Result<PathBuf> {
         .ok_or_else(|| anyhow!("HOME is not set and XDG_DATA_HOME is unavailable"))
 }
 
-fn nix_run_roots_manifest(toplevel: &OsStr, build: bool) -> Result<Option<PathBuf>> {
+struct NixRunRootsBuildInputs<'a> {
+    guest_system: &'a OsStr,
+    nixpkgs: &'a OsStr,
+    nix: &'a OsStr,
+}
+
+fn nix_run_roots_manifest(build: bool) -> Result<Option<PathBuf>> {
     let guest_system = std::env::var_os("CLAUDEPOD_GUEST_SYSTEM").filter(|value| !value.is_empty());
     let nixpkgs = std::env::var_os("CLAUDEPOD_NIXPKGS").filter(|value| !value.is_empty());
     let (Some(guest_system), Some(nixpkgs)) = (guest_system, nixpkgs) else {
         if build {
-            bail!("--build-nix-run-roots requires CLAUDEPOD_GUEST_SYSTEM and CLAUDEPOD_NIXPKGS");
+            bail!(
+                "--build-nix-run-roots requires CLAUDEPOD_GUEST_SYSTEM, CLAUDEPOD_NIXPKGS, and CLAUDEPOD_NIX"
+            );
         }
         return Ok(None);
     };
 
-    let path = nix_run_roots_manifest_path(&guest_system, &nixpkgs, toplevel)?;
-    if path
-        .try_exists()
-        .with_context(|| format!("stat {}", path.display()))?
-    {
-        claudepod::proxy::NixRunRoots::load(&path)?;
+    let path = nix_run_roots_manifest_path(&guest_system, &nixpkgs)?;
+    if let Some(path) = load_nix_run_roots_manifest(&path)? {
         return Ok(Some(path));
     }
 
     if build {
-        bail!(
-            "nix run root manifest {} is missing; --build-nix-run-roots is not implemented yet",
-            path.display()
-        );
+        let nix = required_env_os("CLAUDEPOD_NIX")?;
+        build_nix_run_roots_manifest(
+            &path,
+            &NixRunRootsBuildInputs {
+                guest_system: &guest_system,
+                nixpkgs: &nixpkgs,
+                nix: &nix,
+            },
+        )?;
+        return Ok(Some(path.to_path_buf()));
     }
 
-    eprintln!("nix run root manifest missing; proxy fills disabled");
-    eprintln!("run: claudepod --build-nix-run-roots");
+    print_nix_run_roots_disabled();
     Ok(None)
 }
 
-fn nix_run_roots_manifest_path(
-    guest_system: &OsStr,
-    nixpkgs: &OsStr,
-    toplevel: &OsStr,
-) -> Result<PathBuf> {
-    let relative = nix_run_roots_manifest_relative_path(guest_system, nixpkgs, toplevel)?;
+fn load_nix_run_roots_manifest(path: &Path) -> Result<Option<PathBuf>> {
+    if !path
+        .try_exists()
+        .with_context(|| format!("stat {}", path.display()))?
+    {
+        return Ok(None);
+    }
+
+    claudepod::proxy::NixRunRoots::load(path)?;
+    Ok(Some(path.to_path_buf()))
+}
+
+fn print_nix_run_roots_disabled() {
+    eprintln!("nix run root manifest missing; proxy fills disabled");
+    eprintln!("run: claudepod --build-nix-run-roots");
+}
+
+fn build_nix_run_roots_manifest(path: &Path, inputs: &NixRunRootsBuildInputs<'_>) -> Result<()> {
+    let manifest = generate_nix_run_roots_manifest(inputs)?;
+    write_nix_run_roots_manifest_atomic(path, &manifest)
+}
+
+fn generate_nix_run_roots_manifest(inputs: &NixRunRootsBuildInputs<'_>) -> Result<Vec<u8>> {
+    let output = nix_run_roots_command(inputs)?
+        .output()
+        .with_context(|| format!("run {}", Path::new(inputs.nix).display()))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = stderr.trim();
+        if stderr.is_empty() {
+            bail!(
+                "{} exited with {}",
+                Path::new(inputs.nix).display(),
+                output.status
+            );
+        }
+        bail!(
+            "{} exited with {}: {stderr}",
+            Path::new(inputs.nix).display(),
+            output.status
+        );
+    }
+
+    Ok(output.stdout)
+}
+
+fn nix_run_roots_command(inputs: &NixRunRootsBuildInputs<'_>) -> Result<Command> {
+    validate_nix_run_roots_inputs(inputs)?;
+    let mut command = Command::new(inputs.nix);
+    command
+        .env("CLAUDEPOD_GUEST_SYSTEM", inputs.guest_system)
+        .env("CLAUDEPOD_NIXPKGS", inputs.nixpkgs)
+        .arg("--extra-experimental-features")
+        .arg("nix-command")
+        .arg("eval")
+        .arg("--impure")
+        .arg("--raw")
+        .arg("--expr")
+        .arg(NIX_RUN_ROOTS_EXPR);
+    Ok(command)
+}
+
+fn write_nix_run_roots_manifest_atomic(path: &Path, contents: &[u8]) -> Result<()> {
+    let dir = path
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+
+    let (tmp_path, mut tmp_file) = create_manifest_temp_file(path)?;
+
+    let result = (|| -> Result<()> {
+        tmp_file
+            .write_all(contents)
+            .with_context(|| format!("write {}", tmp_path.display()))?;
+        tmp_file
+            .sync_all()
+            .with_context(|| format!("fsync {}", tmp_path.display()))?;
+        drop(tmp_file);
+
+        claudepod::proxy::NixRunRoots::load(&tmp_path)?;
+        std::fs::rename(&tmp_path, path)
+            .with_context(|| format!("rename {} to {}", tmp_path.display(), path.display()))?;
+        fsync_dir_best_effort(dir);
+        Ok(())
+    })();
+
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+
+    result
+}
+
+fn create_manifest_temp_file(path: &Path) -> Result<(PathBuf, File)> {
+    let dir = path
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| anyhow!("manifest path has no file name: {}", path.display()))?;
+
+    let mut tmp_name = OsString::from(".");
+    tmp_name.push(file_name);
+    tmp_name.push(format!(".{}.tmp", std::process::id()));
+    let tmp_path = dir.join(tmp_name);
+
+    match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp_path)
+    {
+        Ok(file) => Ok((tmp_path, file)),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            std::fs::remove_file(&tmp_path)
+                .with_context(|| format!("remove stale {}", tmp_path.display()))?;
+            let file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp_path)
+                .with_context(|| format!("create {}", tmp_path.display()))?;
+            Ok((tmp_path, file))
+        }
+        Err(err) => Err(err).with_context(|| format!("create {}", tmp_path.display())),
+    }
+}
+
+fn fsync_dir_best_effort(dir: &Path) {
+    if let Ok(file) = File::open(dir) {
+        let _ = file.sync_all();
+    }
+}
+
+fn validate_nix_run_roots_inputs(inputs: &NixRunRootsBuildInputs<'_>) -> Result<()> {
+    claudepod::store_path::validate_direct(Path::new(inputs.nixpkgs)).with_context(|| {
+        format!(
+            "parse CLAUDEPOD_NIXPKGS={}",
+            inputs.nixpkgs.to_string_lossy()
+        )
+    })?;
+
+    let guest_system = inputs
+        .guest_system
+        .to_str()
+        .ok_or_else(|| anyhow!("CLAUDEPOD_GUEST_SYSTEM is not valid UTF-8"))?;
+    if guest_system.is_empty()
+        || !guest_system
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        bail!("CLAUDEPOD_GUEST_SYSTEM is not a supported Nix system name");
+    }
+    Ok(())
+}
+
+fn nix_run_roots_manifest_path(guest_system: &OsStr, nixpkgs: &OsStr) -> Result<PathBuf> {
+    let relative = nix_run_roots_manifest_relative_path(guest_system, nixpkgs)?;
     xdg::BaseDirectories::with_prefix("claudepod")
         .get_cache_file(relative)
         .ok_or_else(|| anyhow!("HOME is not set and XDG_CACHE_HOME is unavailable"))
 }
 
-fn nix_run_roots_manifest_relative_path(
-    guest_system: &OsStr,
-    nixpkgs: &OsStr,
-    toplevel: &OsStr,
-) -> Result<PathBuf> {
+fn nix_run_roots_manifest_relative_path(guest_system: &OsStr, nixpkgs: &OsStr) -> Result<PathBuf> {
     let guest_system = cache_path_segment("CLAUDEPOD_GUEST_SYSTEM", guest_system)?;
     let nixpkgs_hash = claudepod::store_path::direct_hash(Path::new(nixpkgs))
         .with_context(|| format!("parse CLAUDEPOD_NIXPKGS={}", nixpkgs.to_string_lossy()))?;
-    let toplevel_hash = claudepod::store_path::direct_hash(Path::new(toplevel))
-        .with_context(|| format!("parse selected toplevel={}", toplevel.to_string_lossy()))?;
 
     Ok(PathBuf::from("nix-run-roots")
         .join("v1")
         .join(guest_system)
-        .join(nixpkgs_hash)
-        .join(format!("{toplevel_hash}.txt")))
+        .join(format!("{nixpkgs_hash}.txt")))
 }
 
 fn cache_path_segment<'a>(name: &str, value: &'a OsStr) -> Result<&'a str> {
@@ -609,11 +795,15 @@ fn guest_project_path(
 #[cfg(test)]
 mod tests {
     use super::{
-        PortMap, guest_project_path, nix_run_roots_manifest_relative_path, pasta_tcp_ns_arg,
-        publish_arg, volume_spec,
+        NixRunRootsBuildInputs, PortMap, guest_project_path, load_nix_run_roots_manifest,
+        nix_run_roots_command, nix_run_roots_manifest_relative_path, pasta_tcp_ns_arg, publish_arg,
+        volume_spec, write_nix_run_roots_manifest_atomic,
     };
     use std::ffi::OsStr;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEST_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     #[test]
     fn volume_specs_preserve_os_path_components() {
@@ -694,23 +884,157 @@ mod tests {
         assert_eq!(
             nix_run_roots_manifest_relative_path(
                 OsStr::new("x86_64-linux"),
-                OsStr::new("/nix/store/nixpkgs123-source"),
-                OsStr::new("/nix/store/top123-nixos-system-host")
+                OsStr::new("/nix/store/nixpkgs123-source")
             )
             .unwrap(),
             Path::new("nix-run-roots")
                 .join("v1")
                 .join("x86_64-linux")
-                .join("nixpkgs123")
-                .join("top123.txt")
+                .join("nixpkgs123.txt")
         );
         assert!(
             nix_run_roots_manifest_relative_path(
                 OsStr::new("../bad"),
-                OsStr::new("/nix/store/nixpkgs123-source"),
-                OsStr::new("/nix/store/top123-nixos-system-host")
+                OsStr::new("/nix/store/nixpkgs123-source")
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn atomic_manifest_write_creates_parent_and_replaces_file() {
+        let dir = temp_test_dir("atomic-valid");
+        let manifest = dir.join("cache/run-roots.txt");
+
+        write_nix_run_roots_manifest_atomic(
+            &manifest,
+            b"/nix/store/aaa111-one\n/nix/store/bbb222-two\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&manifest).unwrap(),
+            "/nix/store/aaa111-one\n/nix/store/bbb222-two\n"
+        );
+    }
+
+    #[test]
+    fn atomic_manifest_write_validates_before_replace() {
+        let dir = temp_test_dir("atomic-invalid");
+        let manifest = dir.join("run-roots.txt");
+        std::fs::write(&manifest, b"/nix/store/old111-old\n").unwrap();
+
+        assert!(write_nix_run_roots_manifest_atomic(&manifest, b"/tmp/not-store\n").is_err());
+
+        assert_eq!(
+            std::fs::read_to_string(&manifest).unwrap(),
+            "/nix/store/old111-old\n"
+        );
+        let entries = std::fs::read_dir(&dir).unwrap().count();
+        assert_eq!(entries, 1);
+    }
+
+    #[test]
+    fn manifest_loader_accepts_existing_file() {
+        let dir = temp_test_dir("load-existing");
+        let manifest = dir.join("run-roots.txt");
+        std::fs::write(&manifest, b"/nix/store/aaa111-one\n").unwrap();
+
+        assert_eq!(
+            load_nix_run_roots_manifest(&manifest).unwrap(),
+            Some(manifest)
+        );
+    }
+
+    #[test]
+    fn manifest_loader_returns_none_when_missing() {
+        let dir = temp_test_dir("load-missing");
+        let manifest = dir.join("run-roots.txt");
+
+        assert_eq!(load_nix_run_roots_manifest(&manifest).unwrap(), None);
+        assert!(!manifest.exists());
+    }
+
+    #[test]
+    fn nix_run_roots_command_uses_pinned_inputs() {
+        let inputs = NixRunRootsBuildInputs {
+            guest_system: OsStr::new("x86_64-linux"),
+            nixpkgs: OsStr::new("/nix/store/nixpkgs123-source"),
+            nix: OsStr::new("/nix/store/nix123-nix/bin/nix"),
+        };
+
+        let command = nix_run_roots_command(&inputs).unwrap();
+
+        assert_eq!(
+            command.get_program(),
+            OsStr::new("/nix/store/nix123-nix/bin/nix")
+        );
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            &args[..6],
+            [
+                "--extra-experimental-features",
+                "nix-command",
+                "eval",
+                "--impure",
+                "--raw",
+                "--expr"
+            ]
+        );
+        assert!(args[6].contains("builtins.getEnv \"CLAUDEPOD_NIXPKGS\""));
+        assert!(args[6].contains("builtins.getEnv \"CLAUDEPOD_GUEST_SYSTEM\""));
+        assert!(args[6].contains("allowUnfree = true;"));
+        assert!(args[6].contains("allowAliases = false;"));
+        assert!(args[6].contains("builtins.unsafeDiscardStringContext"));
+
+        let env = command
+            .get_envs()
+            .map(|(name, value)| (name, value.unwrap()))
+            .collect::<Vec<_>>();
+        assert!(env.contains(&(
+            OsStr::new("CLAUDEPOD_GUEST_SYSTEM"),
+            OsStr::new("x86_64-linux")
+        )));
+        assert!(env.contains(&(
+            OsStr::new("CLAUDEPOD_NIXPKGS"),
+            OsStr::new("/nix/store/nixpkgs123-source")
+        )));
+    }
+
+    #[test]
+    fn nix_run_roots_command_rejects_bad_inputs() {
+        assert!(
+            nix_run_roots_command(&NixRunRootsBuildInputs {
+                guest_system: OsStr::new("x86_64-linux\""),
+                nixpkgs: OsStr::new("/nix/store/nixpkgs123-source"),
+                nix: OsStr::new("/nix/store/nix123-nix/bin/nix"),
+            })
+            .is_err()
+        );
+        assert!(
+            nix_run_roots_command(&NixRunRootsBuildInputs {
+                guest_system: OsStr::new("x86_64-linux"),
+                nixpkgs: OsStr::new("nixpkgs123-source"),
+                nix: OsStr::new("/nix/store/nix123-nix/bin/nix"),
+            })
+            .is_err()
+        );
+    }
+
+    fn temp_test_dir(name: &str) -> PathBuf {
+        let id = TEST_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "claudepod-start-{name}-{}-{nonce}-{id}",
+            std::process::id(),
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        dir
     }
 }
