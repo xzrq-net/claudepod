@@ -51,11 +51,15 @@ async fn reexec_under_unshare() -> Result<()> {
 
 struct Env {
     home: PathBuf,
-    conf: PathBuf,
+    guest_conf: PathBuf,
+    host_conf: PathBuf,
     host_root: PathBuf,
     host_store: PathBuf,
     host_socket: PathBuf,
+    cache: PathBuf,
+    nix_run_roots_manifest: PathBuf,
     proxy_socket: PathBuf,
+    disabled_proxy_socket: PathBuf,
     guest_root: PathBuf,
     guest_store: PathBuf,
     guest_upper: PathBuf,
@@ -77,6 +81,9 @@ async fn run() -> Result<()> {
     run_tests!(
         fixture,
         query_host_path,
+        proxy_fill_enabled,
+        proxy_fill_manifest_miss,
+        proxy_fill_disabled,
         closure_sync,
         guest_build_with_host_deps,
         build_dedup,
@@ -93,6 +100,15 @@ struct Fixture {
     env: Env,
     /// Store path seeded into the host store, absent from the guest's upper db.
     host_path: String,
+    /// Store path absent from the host store, but available from the local cache
+    /// and authorized in the proxy run-roots manifest.
+    fill_path: String,
+    /// Store path absent from the host store and available from the local cache,
+    /// but not authorized in the proxy run-roots manifest.
+    manifest_miss_path: String,
+    /// Store path absent from the host store and available from the local cache;
+    /// used against a proxy with fills disabled.
+    disabled_fill_path: String,
     _host_daemon: Child,
     _guest_daemon: Child,
 }
@@ -105,7 +121,7 @@ impl Fixture {
         step("start host nix-daemon");
         let host_daemon = env
             .spawn_daemon(
-                env.daemon_cmd("nix-daemon", &env.host_store_uri(), &env.host_socket),
+                env.host_daemon_cmd("nix-daemon", &env.host_store_uri(), &env.host_socket),
                 &env.host_socket,
             )
             .await?;
@@ -114,7 +130,7 @@ impl Fixture {
         let seed = env.home.join("seed");
         std::fs::write(&seed, "claudepod e2e seed\n")?;
         let out = run_cmd(
-            env.nix_cmd("nix-store", &env.host_daemon_uri())
+            env.host_nix_cmd("nix-store", &env.host_daemon_uri())
                 .arg("--add")
                 .arg(&seed),
         )
@@ -126,11 +142,29 @@ impl Fixture {
         );
         eprintln!("seeded {host_path}");
 
+        step("seed binary cache");
+        let fill_path = cache_substitutable_path(&env, "fill", "claudepod e2e fill seed\n").await?;
+        let manifest_miss_path =
+            cache_substitutable_path(&env, "manifest-miss", "claudepod e2e manifest miss\n")
+                .await?;
+        let disabled_fill_path =
+            cache_substitutable_path(&env, "disabled-fill", "claudepod e2e disabled fill\n")
+                .await?;
+        std::fs::write(&env.nix_run_roots_manifest, format!("{fill_path}\n"))?;
+        let nix_run_roots = claudepod::proxy::NixRunRoots::load(&env.nix_run_roots_manifest)?;
+
         step("start proxy");
         let listener = UnixListener::bind(&env.proxy_socket)?;
         let upstream = env.host_socket.clone();
         tokio::spawn(async move {
-            if let Err(err) = claudepod::proxy::serve(listener, upstream, None).await {
+            if let Err(err) = claudepod::proxy::serve_with_run_roots(
+                listener,
+                upstream,
+                Some(nix_run_roots),
+                None,
+            )
+            .await
+            {
                 eprintln!("proxy died: {err:#}");
             }
         });
@@ -146,6 +180,9 @@ impl Fixture {
         Ok(Fixture {
             env,
             host_path,
+            fill_path,
+            manifest_miss_path,
+            disabled_fill_path,
             _host_daemon: host_daemon,
             _guest_daemon: guest_daemon,
         })
@@ -155,13 +192,14 @@ impl Fixture {
     /// `root=` so clients that stat realized paths use the rooted physical
     /// store, while operations still flow through the daemon/proxy chain.
     fn guest_cmd(&self, program: &str) -> Command {
-        self.env.nix_cmd(program, &self.env.guest_daemon_uri())
+        self.env
+            .guest_nix_cmd(program, &self.env.guest_daemon_uri())
     }
 
     /// Client command against the host daemon, with the same rooted physical
     /// store mapping as the daemon.
     fn host_cmd(&self, program: &str) -> Command {
-        self.env.nix_cmd(program, &self.env.host_daemon_uri())
+        self.env.host_nix_cmd(program, &self.env.host_daemon_uri())
     }
 
     /// `nix-build` a one-echo derivation; returns the output path. `dep`
@@ -205,7 +243,7 @@ impl Fixture {
         std::fs::create_dir_all(&scratch)?;
         let out = run_cmd(
             self.env
-                .nix_cmd("nix-store", &format!("local://?root={}", scratch.display()))
+                .guest_nix_cmd("nix-store", &format!("local://?root={}", scratch.display()))
                 .arg("--add")
                 .arg(file),
         )
@@ -221,6 +259,75 @@ impl Fixture {
 
     async fn query_host_path(&self) -> Result<()> {
         run_cmd(self.guest_cmd("nix").arg("path-info").arg(&self.host_path)).await?;
+        Ok(())
+    }
+
+    /// Friction: a path missing from the live host store but authorized by the
+    /// run-roots manifest must be filled through the proxy's host EnsurePath.
+    /// The result belongs in the host lower store, not the guest upper layer.
+    async fn proxy_fill_enabled(&self) -> Result<()> {
+        assert_host_invalid(&self.env, &self.fill_path).await?;
+        run_cmd(self.guest_cmd("nix").args(["path-info", &self.fill_path])).await?;
+        assert_host_valid(&self.env, &self.fill_path).await?;
+        ensure!(
+            self.env.host_physical_path(&self.fill_path)?.exists(),
+            "filled path {} missing from host store",
+            self.fill_path
+        );
+        ensure!(
+            !self.env.guest_upper_path(&self.fill_path)?.exists(),
+            "filled path {} was copied into the guest upper layer",
+            self.fill_path
+        );
+        Ok(())
+    }
+
+    /// Friction: cache availability alone is not enough. A path outside the
+    /// run-roots manifest must remain invalid and must not be realized on the
+    /// host as a side effect of a guest query.
+    async fn proxy_fill_manifest_miss(&self) -> Result<()> {
+        assert_host_invalid(&self.env, &self.manifest_miss_path).await?;
+        run_cmd_fail(
+            self.guest_cmd("nix")
+                .args(["path-info", &self.manifest_miss_path]),
+        )
+        .await?;
+        assert_host_invalid(&self.env, &self.manifest_miss_path).await?;
+        ensure!(
+            !self
+                .env
+                .guest_upper_path(&self.manifest_miss_path)?
+                .exists(),
+            "manifest miss {} was copied into the guest upper layer",
+            self.manifest_miss_path
+        );
+        Ok(())
+    }
+
+    /// Friction: a host cache hit must not imply a fill when the proxy was
+    /// started without a run-roots manifest. This drives a second proxy
+    /// directly as a lower store so the main guest/proxy session can keep
+    /// testing the enabled-manifest path.
+    async fn proxy_fill_disabled(&self) -> Result<()> {
+        assert_host_invalid(&self.env, &self.disabled_fill_path).await?;
+
+        let listener = UnixListener::bind(&self.env.disabled_proxy_socket)?;
+        let upstream = self.env.host_socket.clone();
+        tokio::spawn(async move {
+            if let Err(err) = claudepod::proxy::serve(listener, upstream, None).await {
+                eprintln!("disabled proxy died: {err:#}");
+            }
+        });
+
+        let remote = format!("unix://{}", self.env.disabled_proxy_socket.display());
+        run_cmd_fail(
+            self.env
+                .guest_nix_cmd("nix-store", &remote)
+                .arg("--check-validity")
+                .arg(&self.disabled_fill_path),
+        )
+        .await?;
+        assert_host_invalid(&self.env, &self.disabled_fill_path).await?;
         Ok(())
     }
 
@@ -377,6 +484,11 @@ impl Fixture {
             self.env.host_physical_path(&self.host_path)?.exists(),
             "guest gc deleted a lower store path from disk"
         );
+        assert_host_valid(&self.env, &self.fill_path).await?;
+        ensure!(
+            self.env.host_physical_path(&self.fill_path)?.exists(),
+            "guest gc deleted a filled lower store path from disk"
+        );
         Ok(())
     }
 
@@ -436,11 +548,15 @@ impl Env {
         let root = PathBuf::from("/tmp/claudepod-e2e");
         let env = Env {
             home: root.join("home"),
-            conf: root.join("etc"),
+            guest_conf: root.join("guest/etc"),
+            host_conf: root.join("host/etc"),
             host_root: root.join("host/root"),
             host_store: root.join("host/root/nix/store"),
             host_socket: root.join("host/daemon-socket/socket"),
+            cache: root.join("cache"),
+            nix_run_roots_manifest: root.join("nix-run-roots"),
             proxy_socket: root.join("proxy.sock"),
+            disabled_proxy_socket: root.join("proxy-disabled.sock"),
             guest_root: root.join("guest/root"),
             guest_store: root.join("guest/root/nix/store"),
             guest_upper: root.join("guest/upper"),
@@ -463,9 +579,11 @@ impl Env {
         let guest_work = root.join("guest/work");
         for dir in [
             &env.home,
-            &env.conf,
+            &env.guest_conf,
+            &env.host_conf,
             &env.host_store,
             env.host_socket.parent().unwrap(),
+            &env.cache,
             &guest_lower,
             &env.guest_upper,
             &guest_work,
@@ -479,12 +597,24 @@ impl Env {
         // connections look like the real setup, where the proxy connects to
         // the host daemon as a plain user.
         std::fs::write(
-            env.conf.join("nix.conf"),
+            env.guest_conf.join("nix.conf"),
             "experimental-features = nix-command local-overlay-store\n\
              build-users-group =\n\
              require-drop-supplementary-groups = false\n\
              substituters =\n\
              trusted-users =\n",
+        )?;
+        std::fs::write(
+            env.host_conf.join("nix.conf"),
+            format!(
+                "experimental-features = nix-command\n\
+             build-users-group =\n\
+             require-drop-supplementary-groups = false\n\
+             substituters = {}\n\
+             require-sigs = false\n\
+             trusted-users =\n",
+                env.cache_uri()
+            ),
         )?;
 
         mount(
@@ -551,15 +681,33 @@ impl Env {
         )
     }
 
+    fn cache_uri(&self) -> String {
+        format!("file://{}", self.cache.display())
+    }
+
     /// Common nix process environment: clean slate, config, and store URI.
-    fn nix_cmd(&self, program: &str, remote: &str) -> Command {
+    fn guest_nix_cmd(&self, program: &str, remote: &str) -> Command {
+        self.nix_cmd_with_conf(program, remote, &self.guest_conf)
+    }
+
+    fn host_nix_cmd(&self, program: &str, remote: &str) -> Command {
+        self.nix_cmd_with_conf(program, remote, &self.host_conf)
+    }
+
+    fn nix_cmd_with_conf(&self, program: &str, remote: &str, conf: &Path) -> Command {
         let mut cmd = Command::new(program);
-        self.apply_nix_env(&mut cmd, remote);
+        self.apply_nix_env(&mut cmd, remote, conf);
         cmd
     }
 
     fn daemon_cmd(&self, program: &str, remote: &str, socket: &Path) -> Command {
-        let mut cmd = self.nix_cmd(program, remote);
+        let mut cmd = self.guest_nix_cmd(program, remote);
+        cmd.env("NIX_DAEMON_SOCKET_PATH", socket);
+        cmd
+    }
+
+    fn host_daemon_cmd(&self, program: &str, remote: &str, socket: &Path) -> Command {
+        let mut cmd = self.host_nix_cmd(program, remote);
         cmd.env("NIX_DAEMON_SOCKET_PATH", socket);
         cmd
     }
@@ -568,11 +716,15 @@ impl Env {
         physical_store_path(&self.host_store, logical)
     }
 
-    fn apply_nix_env(&self, cmd: &mut Command, remote: &str) {
+    fn guest_upper_path(&self, logical: &str) -> Result<PathBuf> {
+        physical_store_path(&self.guest_upper, logical)
+    }
+
+    fn apply_nix_env(&self, cmd: &mut Command, remote: &str, conf: &Path) {
         cmd.env_clear()
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("HOME", &self.home)
-            .env("NIX_CONF_DIR", &self.conf)
+            .env("NIX_CONF_DIR", conf)
             .env("NIX_USER_CONF_FILES", "")
             .env("NIX_REMOTE", remote);
     }
@@ -595,6 +747,63 @@ impl Env {
             .with_context(|| format!("timed out waiting for {}", socket.display()))??;
         Ok(child)
     }
+}
+
+async fn cache_substitutable_path(env: &Env, tag: &str, contents: &str) -> Result<String> {
+    let seed = env.home.join(format!("cache-{tag}"));
+    std::fs::write(&seed, contents)?;
+
+    let scratch = env.home.join(format!("scratch-cache-{tag}"));
+    std::fs::create_dir_all(&scratch)?;
+    let scratch_store = format!("local://?root={}", scratch.display());
+
+    let out = run_cmd(
+        env.host_nix_cmd("nix-store", &scratch_store)
+            .arg("--add")
+            .arg(&seed),
+    )
+    .await?;
+    let logical = out.trim().to_owned();
+    let physical = physical_store_path(&scratch.join("nix/store"), &logical)?;
+    ensure!(physical.exists(), "scratch store add left no file");
+
+    run_cmd(
+        env.host_nix_cmd("nix", &scratch_store)
+            .args(["copy", "--to"])
+            .arg(env.cache_uri())
+            .arg(&logical),
+    )
+    .await?;
+    assert_host_invalid(env, &logical).await?;
+    Ok(logical)
+}
+
+async fn assert_host_valid(env: &Env, logical: &str) -> Result<()> {
+    run_cmd(
+        env.host_nix_cmd("nix-store", &env.host_daemon_uri())
+            .arg("--check-validity")
+            .arg(logical),
+    )
+    .await?;
+    Ok(())
+}
+
+async fn assert_host_invalid(env: &Env, logical: &str) -> Result<()> {
+    ensure!(
+        !env.host_physical_path(logical)?.exists(),
+        "path {logical} unexpectedly exists in host store"
+    );
+    run_cmd_fail(
+        env.host_nix_cmd("nix-store", &env.host_daemon_uri())
+            .arg("--check-validity")
+            .arg(logical),
+    )
+    .await?;
+    ensure!(
+        !env.host_physical_path(logical)?.exists(),
+        "validity check materialized {logical} in host store"
+    );
+    Ok(())
 }
 
 /// Run a command that is expected to fail; returns its stderr.
