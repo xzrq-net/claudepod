@@ -14,7 +14,6 @@ use super::{handshake, stderr, wire};
 
 const OP_ENSURE_PATH: u64 = 10;
 
-#[allow(dead_code)] // Used by the later IsValidPath interception slice.
 pub(crate) async fn ensure_path(upstream: &Path, store_path: &Path) -> Result<()> {
     let host = UnixStream::connect(upstream)
         .await

@@ -170,9 +170,7 @@ fn write_runtime_config(
     // are bash single-quoted.
     let mut env = Vec::new();
     for (name, value) in std::env::vars_os() {
-        if name.as_bytes().starts_with(b"CLAUDE_CODE_")
-            || (name == "MAX_THINKING_TOKENS" && !value.is_empty())
-        {
+        if claudepod::agent_env::forwarded(&name, &value) {
             append_env_line(&mut env, &name, &value);
         }
     }

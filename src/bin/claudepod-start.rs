@@ -145,22 +145,22 @@ fn main() -> Result<()> {
     let proxy_socket = spawn_nix_proxy(nix_run_roots.as_deref())?;
 
     let mut volumes = vec![
-        volume_spec(Path::new("/nix/store"), Path::new("/nix/store"), Some("ro")),
+        volume_spec(Path::new("/nix/store"), Path::new("/nix/store"), Some("ro"))?,
         volume_spec(
             &proxy_socket,
             Path::new("/nix/.host-nix-daemon/socket"),
             None,
-        ),
-        volume_spec(&home_dir, Path::new(&home), None),
+        )?,
+        volume_spec(&home_dir, Path::new(&home), None)?,
     ];
     if let Some(src_root) = &src_root {
-        volumes.push(volume_spec(src_root, &Path::new(&home).join("src"), None));
+        volumes.push(volume_spec(src_root, &Path::new(&home).join("src"), None)?);
     }
     for (host, guest) in parent_layers.iter().zip(&child_layers) {
-        volumes.push(volume_spec(host, guest, Some("ro")));
+        volumes.push(volume_spec(host, guest, Some("ro"))?);
     }
     if need_project_share {
-        volumes.push(volume_spec(&project_dir, Path::new(&guest_path), None));
+        volumes.push(volume_spec(&project_dir, Path::new(&guest_path), None)?);
     }
     for spec in args.extra_volumes {
         if spec.as_encoded_bytes().contains(&b':') {
@@ -174,13 +174,10 @@ fn main() -> Result<()> {
     }
 
     let mut env_names = std::env::vars_os()
+        .filter(|(name, value)| claudepod::agent_env::forwarded(name, value))
         .map(|(name, _value)| name)
-        .filter(|name| name.as_bytes().starts_with(b"CLAUDE_CODE_"))
         .collect::<Vec<_>>();
     env_names.sort();
-    if std::env::var_os("MAX_THINKING_TOKENS").is_some_and(|value| !value.is_empty()) {
-        env_names.push(OsString::from("MAX_THINKING_TOKENS"));
-    }
 
     println!("Starting {}...", command_name.to_string_lossy());
     println!("  Host path: {}", project_dir.display());
@@ -274,7 +271,7 @@ fn main() -> Result<()> {
         .arg(format!("CLAUDEPOD_PROJECT_PATH={guest_path}"))
         .arg("-e")
         .arg(format!("CLAUDEPOD_MODE={mode}"))
-        .arg(rootfs_spec(&rootfs_dir))
+        .arg(rootfs_spec(&rootfs_dir)?)
         .arg(init)
         .args(args.command);
 
@@ -650,7 +647,9 @@ fn absolute_path(path: &Path) -> Result<PathBuf> {
     }
 }
 
-fn volume_spec(host: &Path, guest: &Path, options: Option<&str>) -> OsString {
+fn volume_spec(host: &Path, guest: &Path, options: Option<&str>) -> Result<OsString> {
+    reject_colon_path("host volume", host)?;
+    reject_colon_path("guest volume", guest)?;
     let mut spec = OsString::from(host.as_os_str());
     spec.push(":");
     spec.push(guest.as_os_str());
@@ -658,13 +657,24 @@ fn volume_spec(host: &Path, guest: &Path, options: Option<&str>) -> OsString {
         spec.push(":");
         spec.push(options);
     }
-    spec
+    Ok(spec)
 }
 
-fn rootfs_spec(rootfs_dir: &Path) -> OsString {
+fn rootfs_spec(rootfs_dir: &Path) -> Result<OsString> {
+    reject_colon_path("rootfs", rootfs_dir)?;
     let mut spec = OsString::from(rootfs_dir.as_os_str());
     spec.push(":O");
-    spec
+    Ok(spec)
+}
+
+fn reject_colon_path(label: &str, path: &Path) -> Result<()> {
+    if path.as_os_str().as_bytes().contains(&b':') {
+        bail!(
+            "{label} path contains ':' and cannot be encoded as a podman volume spec: {}",
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -811,9 +821,12 @@ mod tests {
                 Path::new("/host path"),
                 Path::new("/guest path"),
                 Some("ro")
-            ),
+            )
+            .unwrap(),
             OsStr::new("/host path:/guest path:ro")
         );
+        assert!(volume_spec(Path::new("/bad:path"), Path::new("/guest"), None).is_err());
+        assert!(volume_spec(Path::new("/host"), Path::new("/bad:guest"), None).is_err());
     }
 
     #[test]

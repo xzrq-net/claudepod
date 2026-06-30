@@ -21,8 +21,10 @@ plus remote-store connection setup, not a generic set of read-only-looking ops:
 Everything else should remain a loud rejection, not opportunistically forwarded.
 
 Before changing guest Nix, `OUR_VERSION`, `OUR_FEATURES`, or the allowlist,
-re-audit every parsed payload in `src/proxy/ops.rs` against Nix
-`local-overlay-store.cc`, `worker-protocol.cc`, and `daemon.cc`.
+re-audit every parsed payload in `src/proxy/handshake.rs`,
+`src/proxy/session.rs`, `src/proxy/ops.rs`, `src/proxy/stderr.rs`, and
+`src/proxy/host_client.rs` against Nix `local-overlay-store.cc`,
+`worker-protocol.cc`, and `daemon.cc`.
 
 `SetOptions` is intentionally parsed for framing and swallowed, not forwarded:
 forwarding would let guest-chosen client settings reach the host daemon. Its

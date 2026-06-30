@@ -62,54 +62,61 @@ where
     W: AsyncWrite + Unpin,
 {
     loop {
-        // Don't forward the message word until it's known to be relayable,
-        // so a violation never leaves the guest mid-message.
-        let msg = wire::read_u64(host).await?;
-        match msg {
-            STDERR_LAST => {
+        // Don't forward until the whole message is known to be relayable, so
+        // a policy violation never leaves the guest mid-message.
+        match read_message(host).await? {
+            Message::Last => {
                 if forward_last {
-                    wire::write_u64(guest, msg).await?;
+                    wire::write_u64(guest, STDERR_LAST).await?;
                 }
                 return Ok(Terminal::Last);
             }
-            STDERR_ERROR => {
-                wire::write_u64(guest, msg).await?;
-                copy_error(host, guest).await?;
+            Message::Error(error) => {
+                wire::write_u64(guest, STDERR_ERROR).await?;
+                write_error_payload(guest, &error).await?;
                 return Ok(Terminal::Error);
             }
-            STDERR_NEXT => {
-                wire::write_u64(guest, msg).await?;
-                wire::copy_string(host, guest, wire::MAX_HOST_STRING).await?;
+            Message::Next(text) => {
+                wire::write_u64(guest, STDERR_NEXT).await?;
+                wire::write_string(guest, &text).await?;
             }
-            STDERR_START_ACTIVITY => {
-                wire::write_u64(guest, msg).await?;
-                wire::copy_u64(host, guest).await?; // activity id
-                wire::copy_u64(host, guest).await?; // verbosity
-                wire::copy_u64(host, guest).await?; // activity type
-                wire::copy_string(host, guest, wire::MAX_HOST_STRING).await?; // text
-                copy_fields(host, guest).await?;
-                wire::copy_u64(host, guest).await?; // parent activity id
+            Message::StartActivity {
+                id,
+                verbosity,
+                activity_type,
+                text,
+                fields,
+                parent,
+            } => {
+                wire::write_u64(guest, STDERR_START_ACTIVITY).await?;
+                wire::write_u64(guest, id).await?;
+                wire::write_u64(guest, verbosity).await?;
+                wire::write_u64(guest, activity_type).await?;
+                wire::write_string(guest, &text).await?;
+                write_fields(guest, &fields).await?;
+                wire::write_u64(guest, parent).await?;
             }
-            STDERR_STOP_ACTIVITY => {
-                wire::write_u64(guest, msg).await?;
-                wire::copy_u64(host, guest).await?; // activity id
+            Message::StopActivity { id } => {
+                wire::write_u64(guest, STDERR_STOP_ACTIVITY).await?;
+                wire::write_u64(guest, id).await?;
             }
-            STDERR_RESULT => {
-                wire::write_u64(guest, msg).await?;
-                wire::copy_u64(host, guest).await?; // activity id
-                wire::copy_u64(host, guest).await?; // result type
-                copy_fields(host, guest).await?;
+            Message::Result {
+                id,
+                result_type,
+                fields,
+            } => {
+                wire::write_u64(guest, STDERR_RESULT).await?;
+                wire::write_u64(guest, id).await?;
+                wire::write_u64(guest, result_type).await?;
+                write_fields(guest, &fields).await?;
             }
-            // The violating word has not been forwarded, so the guest is at
-            // a message boundary and can still parse a synthetic error.
-            // Failures further down (mid-payload) must NOT synthesize one.
-            STDERR_READ | STDERR_WRITE => {
+            Message::Streaming(msg) => {
                 let err =
                     format!("host daemon sent streaming stderr message {msg:#x} during a query op");
                 let _ = write_error(guest, &err).await;
                 bail!(err);
             }
-            _ => {
+            Message::Unknown(msg) => {
                 let err = format!("unknown stderr message {msg:#x} from host daemon");
                 let _ = write_error(guest, &err).await;
                 bail!(err);
@@ -139,64 +146,130 @@ where
 {
     let mut logs = Vec::new();
     loop {
-        let msg = wire::read_u64(host).await?;
-        match msg {
-            STDERR_LAST => return Ok(Drained::Last),
-            STDERR_ERROR => {
-                let mut message = read_error_message(host).await?;
+        match read_message(host).await? {
+            Message::Last => return Ok(Drained::Last),
+            Message::Error(error) => {
+                let mut message = error.daemon_message();
                 if !logs.is_empty() {
                     message.push_str("; logs: ");
                     message.push_str(&logs.join(" | "));
                 }
                 return Ok(Drained::Error(message));
             }
-            STDERR_NEXT => {
-                let text = wire::read_string(host, wire::MAX_HOST_STRING).await?;
-                push_log(&mut logs, text);
+            Message::Next(text) => {
+                push_log(&mut logs, &text);
             }
-            STDERR_START_ACTIVITY => {
-                wire::read_u64(host).await?; // activity id
-                wire::read_u64(host).await?; // verbosity
-                wire::read_u64(host).await?; // activity type
-                let text = wire::read_string(host, wire::MAX_HOST_STRING).await?;
-                push_log(&mut logs, text);
-                drain_fields(host, &mut logs).await?;
-                wire::read_u64(host).await?; // parent activity id
+            Message::StartActivity { text, fields, .. } => {
+                push_log(&mut logs, &text);
+                push_field_logs(&mut logs, &fields);
             }
-            STDERR_STOP_ACTIVITY => {
-                wire::read_u64(host).await?; // activity id
-            }
-            STDERR_RESULT => {
-                wire::read_u64(host).await?; // activity id
-                wire::read_u64(host).await?; // result type
-                drain_fields(host, &mut logs).await?;
-            }
-            STDERR_READ | STDERR_WRITE => {
+            Message::StopActivity { .. } => {}
+            Message::Result { fields, .. } => push_field_logs(&mut logs, &fields),
+            Message::Streaming(msg) => {
                 bail!("host daemon sent streaming stderr message {msg:#x} during proxy-owned op");
             }
-            _ => bail!("unknown stderr message {msg:#x} from host daemon"),
+            Message::Unknown(msg) => bail!("unknown stderr message {msg:#x} from host daemon"),
         }
     }
 }
 
-fn push_log(logs: &mut Vec<String>, raw: Vec<u8>) {
-    let text = String::from_utf8_lossy(&raw).trim_end().to_string();
-    if !text.is_empty() {
-        logs.push(text);
+enum Message {
+    Last,
+    Error(ErrorPayload),
+    Next(Vec<u8>),
+    StartActivity {
+        id: u64,
+        verbosity: u64,
+        activity_type: u64,
+        text: Vec<u8>,
+        fields: Vec<Field>,
+        parent: u64,
+    },
+    StopActivity {
+        id: u64,
+    },
+    Result {
+        id: u64,
+        result_type: u64,
+        fields: Vec<Field>,
+    },
+    Streaming(u64),
+    Unknown(u64),
+}
+
+enum Field {
+    Int(u64),
+    String(Vec<u8>),
+}
+
+struct ErrorPayload {
+    type_name: Vec<u8>,
+    verbosity: u64,
+    name: Vec<u8>,
+    message: Vec<u8>,
+    traces: Vec<Vec<u8>>,
+}
+
+impl ErrorPayload {
+    fn daemon_message(&self) -> String {
+        let mut message = format!("host daemon error: {}", text(&self.message));
+        if !self.traces.is_empty() {
+            message.push_str("; traces: ");
+            message.push_str(
+                &self
+                    .traces
+                    .iter()
+                    .map(|trace| text(trace))
+                    .collect::<Vec<_>>()
+                    .join(" | "),
+            );
+        }
+        message
     }
 }
 
-async fn read_error_message<R>(host: &mut R) -> Result<String>
+async fn read_message<R>(host: &mut R) -> Result<Message>
 where
     R: AsyncRead + Unpin,
 {
-    wire::read_string(host, wire::MAX_HOST_STRING).await?; // type, usually "Error"
-    wire::read_u64(host).await?; // verbosity level
-    wire::read_string(host, wire::MAX_HOST_STRING).await?; // name (removed field)
-    let mut message = format!(
-        "host daemon error: {}",
-        text(wire::read_string(host, wire::MAX_HOST_STRING).await?)
-    );
+    let msg = wire::read_u64(host).await?;
+    match msg {
+        STDERR_LAST => Ok(Message::Last),
+        STDERR_ERROR => Ok(Message::Error(read_error_payload(host).await?)),
+        STDERR_NEXT => Ok(Message::Next(
+            wire::read_string(host, wire::MAX_HOST_STRING).await?,
+        )),
+        STDERR_START_ACTIVITY => Ok(Message::StartActivity {
+            id: wire::read_u64(host).await?,
+            verbosity: wire::read_u64(host).await?,
+            activity_type: wire::read_u64(host).await?,
+            text: wire::read_string(host, wire::MAX_HOST_STRING).await?,
+            fields: read_fields(host).await?,
+            parent: wire::read_u64(host).await?,
+        }),
+        STDERR_STOP_ACTIVITY => Ok(Message::StopActivity {
+            id: wire::read_u64(host).await?,
+        }),
+        STDERR_RESULT => Ok(Message::Result {
+            id: wire::read_u64(host).await?,
+            result_type: wire::read_u64(host).await?,
+            fields: read_fields(host).await?,
+        }),
+        STDERR_READ | STDERR_WRITE => Ok(Message::Streaming(msg)),
+        _ => Ok(Message::Unknown(msg)),
+    }
+}
+
+/// Error payload (serialise.cc `operator<<(Sink &, const Error &)`),
+/// structured format only — guaranteed above the version floor.
+async fn read_error_payload<R>(host: &mut R) -> Result<ErrorPayload>
+where
+    R: AsyncRead + Unpin,
+{
+    let type_name = wire::read_string(host, wire::MAX_HOST_STRING).await?;
+    let verbosity = wire::read_u64(host).await?;
+    let name = wire::read_string(host, wire::MAX_HOST_STRING).await?;
+    let message = wire::read_string(host, wire::MAX_HOST_STRING).await?;
     let have_pos = wire::read_u64(host).await?;
     ensure!(have_pos == 0, "error positions are not supported");
     let trace_count = wire::read_u64(host).await?;
@@ -208,43 +281,36 @@ where
     for _ in 0..trace_count {
         let have_pos = wire::read_u64(host).await?;
         ensure!(have_pos == 0, "error positions are not supported");
-        traces.push(text(wire::read_string(host, wire::MAX_HOST_STRING).await?));
+        traces.push(wire::read_string(host, wire::MAX_HOST_STRING).await?);
     }
-    if !traces.is_empty() {
-        message.push_str("; traces: ");
-        message.push_str(&traces.join(" | "));
-    }
-    Ok(message)
+    Ok(ErrorPayload {
+        type_name,
+        verbosity,
+        name,
+        message,
+        traces,
+    })
 }
 
-fn text(raw: Vec<u8>) -> String {
-    String::from_utf8_lossy(&raw).into_owned()
-}
-
-/// Typed logger fields (worker-protocol-connection.cc readFields).
-async fn copy_fields<R, W>(host: &mut R, guest: &mut W) -> Result<()>
+async fn write_error_payload<W>(guest: &mut W, error: &ErrorPayload) -> Result<()>
 where
-    R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let count = wire::copy_u64(host, guest).await?;
-    ensure!(
-        count <= wire::MAX_COUNT,
-        "field count {count} exceeds limit"
-    );
-    for _ in 0..count {
-        match wire::copy_u64(host, guest).await? {
-            0 => {
-                wire::copy_u64(host, guest).await?;
-            }
-            1 => wire::copy_string(host, guest, wire::MAX_HOST_STRING).await?,
-            t => bail!("unsupported logger field type {t}"),
-        }
+    wire::write_string(guest, &error.type_name).await?;
+    wire::write_u64(guest, error.verbosity).await?;
+    wire::write_string(guest, &error.name).await?;
+    wire::write_string(guest, &error.message).await?;
+    wire::write_u64(guest, 0).await?;
+    wire::write_u64(guest, error.traces.len() as u64).await?;
+    for trace in &error.traces {
+        wire::write_u64(guest, 0).await?;
+        wire::write_string(guest, trace).await?;
     }
     Ok(())
 }
 
-async fn drain_fields<R>(host: &mut R, logs: &mut Vec<String>) -> Result<()>
+/// Typed logger fields (worker-protocol-connection.cc readFields).
+async fn read_fields<R>(host: &mut R) -> Result<Vec<Field>>
 where
     R: AsyncRead + Unpin,
 {
@@ -253,42 +319,54 @@ where
         count <= wire::MAX_COUNT,
         "field count {count} exceeds limit"
     );
+    let mut fields = Vec::with_capacity(count as usize);
     for _ in 0..count {
-        match wire::read_u64(host).await? {
-            0 => {
-                wire::read_u64(host).await?;
-            }
-            1 => push_log(logs, wire::read_string(host, wire::MAX_HOST_STRING).await?),
+        fields.push(match wire::read_u64(host).await? {
+            0 => Field::Int(wire::read_u64(host).await?),
+            1 => Field::String(wire::read_string(host, wire::MAX_HOST_STRING).await?),
             t => bail!("unsupported logger field type {t}"),
+        });
+    }
+    Ok(fields)
+}
+
+async fn write_fields<W>(guest: &mut W, fields: &[Field]) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    wire::write_u64(guest, fields.len() as u64).await?;
+    for field in fields {
+        match field {
+            Field::Int(value) => {
+                wire::write_u64(guest, 0).await?;
+                wire::write_u64(guest, *value).await?;
+            }
+            Field::String(value) => {
+                wire::write_u64(guest, 1).await?;
+                wire::write_string(guest, value).await?;
+            }
         }
     }
     Ok(())
 }
 
-/// Error payload (serialise.cc `operator<<(Sink &, const Error &)`),
-/// structured format only — guaranteed above the version floor.
-async fn copy_error<R, W>(host: &mut R, guest: &mut W) -> Result<()>
-where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
-    wire::copy_string(host, guest, wire::MAX_HOST_STRING).await?; // type, always "Error"
-    wire::copy_u64(host, guest).await?; // verbosity level
-    wire::copy_string(host, guest, wire::MAX_HOST_STRING).await?; // name (removed field)
-    wire::copy_string(host, guest, wire::MAX_HOST_STRING).await?; // message
-    let have_pos = wire::copy_u64(host, guest).await?;
-    ensure!(have_pos == 0, "error positions are not supported");
-    let traces = wire::copy_u64(host, guest).await?;
-    ensure!(
-        traces <= wire::MAX_COUNT,
-        "trace count {traces} exceeds limit"
-    );
-    for _ in 0..traces {
-        let have_pos = wire::copy_u64(host, guest).await?;
-        ensure!(have_pos == 0, "error positions are not supported");
-        wire::copy_string(host, guest, wire::MAX_HOST_STRING).await?; // trace message
+fn push_log(logs: &mut Vec<String>, raw: &[u8]) {
+    let text = String::from_utf8_lossy(raw).trim_end().to_string();
+    if !text.is_empty() {
+        logs.push(text);
     }
-    Ok(())
+}
+
+fn push_field_logs(logs: &mut Vec<String>, fields: &[Field]) {
+    for field in fields {
+        if let Field::String(raw) = field {
+            push_log(logs, raw);
+        }
+    }
+}
+
+fn text(raw: &[u8]) -> String {
+    String::from_utf8_lossy(raw).into_owned()
 }
 
 /// Synthesize a `STDERR_ERROR` toward the guest. Used to reject ops; the
