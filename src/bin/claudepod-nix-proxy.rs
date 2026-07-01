@@ -86,7 +86,7 @@ async fn run(args: Args, listener: StdUnixListener, socket_path: Option<PathBuf>
         socket_path.map(|path| Box::new(move || unlink(&path)) as Box<dyn FnOnce() + Send>);
 
     tokio::select! {
-        result = claudepod::proxy::serve_with_run_roots(listener, args.upstream, nix_run_roots, on_first_accept) => result,
+        result = claudepod::proxy::serve(listener, args.upstream, nix_run_roots, on_first_accept) => result,
         _ = sigterm.recv() => Ok(()),
         _ = sigint.recv() => Ok(()),
     }

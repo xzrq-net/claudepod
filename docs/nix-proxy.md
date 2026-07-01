@@ -20,6 +20,18 @@ plus remote-store connection setup, not a generic set of read-only-looking ops:
 
 Everything else should remain a loud rejection, not opportunistically forwarded.
 
+## On-demand fills
+
+`IsValidPath` is intercepted, not blindly relayed. When the host daemon says
+invalid and the path appears in the run-roots manifest (`--nix-run-roots`,
+built by `claudepod --build-nix-run-roots` from the pinned nixpkgs package
+universe), the proxy issues `EnsurePath` on a fresh proxy-owned host daemon
+connection, re-checks validity, and only then answers the guest. This is the
+one host-store mutation a guest can trigger: substituting a manifest-listed
+path into the host store. Guests never reach `EnsurePath` directly; fill
+targets must parse as direct `<hash>-<name>` store paths and be present in
+the manifest.
+
 Before changing guest Nix, `OUR_VERSION`, `OUR_FEATURES`, or the allowlist,
 re-audit every parsed payload in `src/proxy/handshake.rs`,
 `src/proxy/session.rs`, `src/proxy/ops.rs`, `src/proxy/stderr.rs`, and

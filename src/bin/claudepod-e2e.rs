@@ -157,13 +157,8 @@ impl Fixture {
         let listener = UnixListener::bind(&env.proxy_socket)?;
         let upstream = env.host_socket.clone();
         tokio::spawn(async move {
-            if let Err(err) = claudepod::proxy::serve_with_run_roots(
-                listener,
-                upstream,
-                Some(nix_run_roots),
-                None,
-            )
-            .await
+            if let Err(err) =
+                claudepod::proxy::serve(listener, upstream, Some(nix_run_roots), None).await
             {
                 eprintln!("proxy died: {err:#}");
             }
@@ -314,7 +309,7 @@ impl Fixture {
         let listener = UnixListener::bind(&self.env.disabled_proxy_socket)?;
         let upstream = self.env.host_socket.clone();
         tokio::spawn(async move {
-            if let Err(err) = claudepod::proxy::serve(listener, upstream, None).await {
+            if let Err(err) = claudepod::proxy::serve(listener, upstream, None, None).await {
                 eprintln!("disabled proxy died: {err:#}");
             }
         });

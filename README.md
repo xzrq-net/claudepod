@@ -59,6 +59,7 @@ Options:
   interface address, not guest `127.0.0.1:GUEST`.
 - `-v path`: mount the same host path at the same guest path.
 - `-v host:guest`: mount a host path at a specific guest path.
+  - Relative host paths in either form resolve against the current directory.
 - `command [arg]...`: run this command in the project directory instead of the
   default agent or shell.
 

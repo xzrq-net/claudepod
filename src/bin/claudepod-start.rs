@@ -106,11 +106,17 @@ fn main() -> Result<()> {
 
     let state_dir = state_dir()?;
     let home_dir = if let Some(path) = &args.sandbox_home {
-        absolute_path(path)?
+        std::path::absolute(path).context("resolve --sandbox-home")?
     } else {
         state_dir.join("home")
     };
-    std::fs::create_dir_all(&home_dir).with_context(|| format!("create {}", home_dir.display()))?;
+    // 0700: the backing dir accumulates the guest's agent credential state
+    // (.claude, .codex). Pre-existing dirs keep their mode.
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&home_dir)
+        .with_context(|| format!("create {}", home_dir.display()))?;
     // Lowerdir for `podman run --rootfs ...:O`; all writes go to podman's
     // temporary overlay upperdir, so this must remain empty.
     let rootfs_dir = state_dir.join("empty-rootfs");
@@ -160,17 +166,10 @@ fn main() -> Result<()> {
         volumes.push(volume_spec(host, guest, Some("ro"))?);
     }
     if need_project_share {
-        volumes.push(volume_spec(&project_dir, Path::new(&guest_path), None)?);
+        volumes.push(volume_spec(&project_dir, &guest_path, None)?);
     }
-    for spec in args.extra_volumes {
-        if spec.as_encoded_bytes().contains(&b':') {
-            volumes.push(spec);
-        } else {
-            let mut vol = spec.clone();
-            vol.push(":");
-            vol.push(spec);
-            volumes.push(vol);
-        }
+    for spec in &args.extra_volumes {
+        volumes.push(extra_volume_spec(spec)?);
     }
 
     let mut env_names = std::env::vars_os()
@@ -181,7 +180,7 @@ fn main() -> Result<()> {
 
     println!("Starting {}...", command_name.to_string_lossy());
     println!("  Host path: {}", project_dir.display());
-    println!("  Guest path: {guest_path}");
+    println!("  Guest path: {}", guest_path.display());
     if args.sandbox_home.is_some() {
         println!("  Sandbox home: {}", home_dir.display());
         println!("  Host src: disabled");
@@ -268,7 +267,7 @@ fn main() -> Result<()> {
         .arg("-e")
         .arg(env_arg("CLAUDEPOD_TOPLEVEL", &toplevel))
         .arg("-e")
-        .arg(format!("CLAUDEPOD_PROJECT_PATH={guest_path}"))
+        .arg(env_arg("CLAUDEPOD_PROJECT_PATH", guest_path.as_os_str()))
         .arg("-e")
         .arg(format!("CLAUDEPOD_MODE={mode}"))
         .arg(rootfs_spec(&rootfs_dir)?)
@@ -517,7 +516,7 @@ fn write_nix_run_roots_manifest_atomic(path: &Path, contents: &[u8]) -> Result<(
         .unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
 
-    let (tmp_path, mut tmp_file) = create_manifest_temp_file(path)?;
+    let (tmp_path, mut tmp_file) = create_manifest_temp_file(dir, path)?;
 
     let result = (|| -> Result<()> {
         tmp_file
@@ -542,11 +541,7 @@ fn write_nix_run_roots_manifest_atomic(path: &Path, contents: &[u8]) -> Result<(
     result
 }
 
-fn create_manifest_temp_file(path: &Path) -> Result<(PathBuf, File)> {
-    let dir = path
-        .parent()
-        .filter(|dir| !dir.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
+fn create_manifest_temp_file(dir: &Path, path: &Path) -> Result<(PathBuf, File)> {
     let file_name = path
         .file_name()
         .ok_or_else(|| anyhow!("manifest path has no file name: {}", path.display()))?;
@@ -556,24 +551,21 @@ fn create_manifest_temp_file(path: &Path) -> Result<(PathBuf, File)> {
     tmp_name.push(format!(".{}.tmp", std::process::id()));
     let tmp_path = dir.join(tmp_name);
 
-    match OpenOptions::new()
+    // Remove any stale temp file left by a crashed run under the same pid;
+    // create_new (not truncate) so the temp path is never a followed symlink.
+    match std::fs::remove_file(&tmp_path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(err).with_context(|| format!("remove stale {}", tmp_path.display()));
+        }
+    }
+    let file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&tmp_path)
-    {
-        Ok(file) => Ok((tmp_path, file)),
-        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-            std::fs::remove_file(&tmp_path)
-                .with_context(|| format!("remove stale {}", tmp_path.display()))?;
-            let file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&tmp_path)
-                .with_context(|| format!("create {}", tmp_path.display()))?;
-            Ok((tmp_path, file))
-        }
-        Err(err) => Err(err).with_context(|| format!("create {}", tmp_path.display())),
-    }
+        .with_context(|| format!("create {}", tmp_path.display()))?;
+    Ok((tmp_path, file))
 }
 
 fn fsync_dir_best_effort(dir: &Path) {
@@ -637,16 +629,6 @@ fn src_root() -> Result<PathBuf> {
     Ok(PathBuf::from(home).join("src"))
 }
 
-fn absolute_path(path: &Path) -> Result<PathBuf> {
-    if path.is_absolute() {
-        Ok(path.to_path_buf())
-    } else {
-        Ok(std::env::current_dir()
-            .context("current directory")?
-            .join(path))
-    }
-}
-
 fn volume_spec(host: &Path, guest: &Path, options: Option<&str>) -> Result<OsString> {
     reject_colon_path("host volume", host)?;
     reject_colon_path("guest volume", guest)?;
@@ -658,6 +640,27 @@ fn volume_spec(host: &Path, guest: &Path, options: Option<&str>) -> Result<OsStr
         spec.push(options);
     }
     Ok(spec)
+}
+
+/// A user `-v` spec: `path` or `host:guest[:options]`. The host side is
+/// absolutized because podman silently treats a relative host side as a
+/// named volume, not a bind mount.
+fn extra_volume_spec(spec: &OsStr) -> Result<OsString> {
+    let bytes = spec.as_bytes();
+    let (host, guest_and_options) = match bytes.iter().position(|&byte| byte == b':') {
+        Some(colon) => (&bytes[..colon], &bytes[colon..]),
+        None => (bytes, &[][..]),
+    };
+    let host = std::path::absolute(Path::new(OsStr::from_bytes(host)))
+        .with_context(|| format!("resolve volume spec {}", spec.to_string_lossy()))?;
+    let mut out = OsString::from(&host);
+    if guest_and_options.is_empty() {
+        out.push(":");
+        out.push(&host);
+    } else {
+        out.push(OsStr::from_bytes(guest_and_options));
+    }
+    Ok(out)
 }
 
 fn rootfs_spec(rootfs_dir: &Path) -> Result<OsString> {
@@ -782,33 +785,34 @@ fn guest_project_path(
     project_dir: &Path,
     src_root: Option<&Path>,
     username: &str,
-) -> Result<(String, bool)> {
+) -> Result<(PathBuf, bool)> {
     if let Some(src_root) = src_root
         && let Ok(rel_path) = project_dir.strip_prefix(src_root)
     {
+        let guest_src = PathBuf::from(format!("/home/{username}/src"));
         let guest_path = if rel_path.as_os_str().is_empty() {
-            format!("/home/{username}/src")
+            guest_src
         } else {
-            format!("/home/{username}/src/{}", rel_path.display())
+            guest_src.join(rel_path)
         };
         return Ok((guest_path, false));
     }
 
     let project_name = project_dir
         .file_name()
-        .ok_or_else(|| anyhow!("project directory has no file name"))?
-        .to_string_lossy();
-    Ok((format!("/projects/{project_name}"), true))
+        .ok_or_else(|| anyhow!("project directory has no file name"))?;
+    Ok((PathBuf::from("/projects").join(project_name), true))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        NixRunRootsBuildInputs, PortMap, guest_project_path, load_nix_run_roots_manifest,
-        nix_run_roots_command, nix_run_roots_manifest_relative_path, pasta_tcp_ns_arg, publish_arg,
-        volume_spec, write_nix_run_roots_manifest_atomic,
+        NixRunRootsBuildInputs, PortMap, extra_volume_spec, guest_project_path,
+        load_nix_run_roots_manifest, nix_run_roots_command, nix_run_roots_manifest_relative_path,
+        pasta_tcp_ns_arg, publish_arg, volume_spec, write_nix_run_roots_manifest_atomic,
     };
     use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -830,6 +834,29 @@ mod tests {
     }
 
     #[test]
+    fn extra_volume_specs_absolutize_the_host_side() {
+        assert_eq!(
+            extra_volume_spec(OsStr::new("/data")).unwrap(),
+            OsStr::new("/data:/data")
+        );
+        assert_eq!(
+            extra_volume_spec(OsStr::new("/data:/mnt:ro")).unwrap(),
+            OsStr::new("/data:/mnt:ro")
+        );
+
+        let spec = extra_volume_spec(OsStr::new("data:/mnt")).unwrap();
+        assert!(spec.as_bytes().starts_with(b"/"), "{spec:?}");
+        assert!(spec.as_bytes().ends_with(b"/data:/mnt"), "{spec:?}");
+
+        let spec = extra_volume_spec(OsStr::new("data")).unwrap();
+        let cwd = std::env::current_dir().unwrap().join("data");
+        let mut expected = cwd.clone().into_os_string();
+        expected.push(":");
+        expected.push(&cwd);
+        assert_eq!(spec, expected);
+    }
+
+    #[test]
     fn projects_under_src_use_src_mount_by_default() {
         assert_eq!(
             guest_project_path(
@@ -838,16 +865,41 @@ mod tests {
                 "alice"
             )
             .unwrap(),
-            ("/home/alice/src/proj".to_string(), false)
+            (PathBuf::from("/home/alice/src/proj"), false)
         );
+    }
+
+    #[test]
+    fn project_paths_under_src_preserve_non_utf8_components() {
+        let project_dir = PathBuf::from(OsStr::from_bytes(b"/host/home/src/bad-\xff"));
+
+        let (guest_path, need_project_share) =
+            guest_project_path(&project_dir, Some(Path::new("/host/home/src")), "alice").unwrap();
+
+        assert_eq!(
+            guest_path.as_os_str().as_bytes(),
+            b"/home/alice/src/bad-\xff"
+        );
+        assert!(!need_project_share);
     }
 
     #[test]
     fn projects_under_src_are_mounted_separately_without_src_mount() {
         assert_eq!(
             guest_project_path(Path::new("/host/home/src/proj"), None, "alice").unwrap(),
-            ("/projects/proj".to_string(), true)
+            (PathBuf::from("/projects/proj"), true)
         );
+    }
+
+    #[test]
+    fn separately_mounted_project_paths_preserve_non_utf8_basenames() {
+        let project_dir = PathBuf::from(OsStr::from_bytes(b"/host/home/bad-\xff"));
+
+        let (guest_path, need_project_share) =
+            guest_project_path(&project_dir, None, "alice").unwrap();
+
+        assert_eq!(guest_path.as_os_str().as_bytes(), b"/projects/bad-\xff");
+        assert!(need_project_share);
     }
 
     #[test]

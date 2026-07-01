@@ -36,14 +36,6 @@ const MAX_SESSIONS: usize = 32;
 pub async fn serve(
     listener: UnixListener,
     upstream: PathBuf,
-    on_first_accept: Option<Box<dyn FnOnce() + Send>>,
-) -> Result<()> {
-    serve_with_run_roots(listener, upstream, None, on_first_accept).await
-}
-
-pub async fn serve_with_run_roots(
-    listener: UnixListener,
-    upstream: PathBuf,
     nix_run_roots: Option<NixRunRoots>,
     mut on_first_accept: Option<Box<dyn FnOnce() + Send>>,
 ) -> Result<()> {
