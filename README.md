@@ -10,7 +10,11 @@ model:
   host `~/src` are mounted read-write and shared between instances
 - `--sandbox-home DIR` uses a caller-selected home backing directory and skips
   the host `~/src` mount
-- current directory mounted read-write under `/projects/<name>`
+- current directory mounted read-write:
+  - under `~/src`, through the default `~/src` mount when enabled
+  - under `~/projects` or `~/temp`, at the same absolute path; only the current
+    directory is mounted, not its parents
+  - otherwise under `/projects/<name>`
 - unrestricted Internet and local network access
 - passwordless sudo into container root
 - leaks host details like mount names and hardware info
@@ -74,6 +78,8 @@ Builtin paths:
 - Default guest home backing directory: state directory + `/home`
 - Default source root mounted into the guest: `$HOME/src`, unless
   `--sandbox-home` is used
+- Project paths under `$HOME/projects` or `$HOME/temp` are mounted 1:1 at the
+  same absolute guest path, with only the selected project directory shared.
 
 ## Home Manager Usage
 

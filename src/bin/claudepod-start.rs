@@ -137,8 +137,22 @@ fn main() -> Result<()> {
     } else {
         Some(src_root()?)
     };
-    let (guest_path, need_project_share) =
-        guest_project_path(&project_dir, src_root.as_deref(), &username)?;
+    let one_to_one_project_roots = one_to_one_project_roots();
+    let (guest_path, need_project_share) = guest_project_path(
+        &project_dir,
+        src_root.as_deref(),
+        &one_to_one_project_roots,
+        &username,
+    )?;
+    // Pre-create mountpoints nested inside the guest home so they're owned by
+    // the invoking user (guest uid 1000 under keep-id); otherwise the runtime
+    // creates them as container root, leaving ~/projects unwritable in the
+    // guest and subuid-owned residue in the backing dir.
+    if need_project_share && let Ok(rel_path) = guest_path.strip_prefix(&home) {
+        let mountpoint = home_dir.join(rel_path);
+        std::fs::create_dir_all(&mountpoint)
+            .with_context(|| format!("create {}", mountpoint.display()))?;
+    }
     let parent_layers = parent_store_layers()?;
     let timezone = host_timezone();
     // Bind inherited layers at short guest paths before passing them to the
@@ -624,9 +638,21 @@ fn cache_path_segment<'a>(name: &str, value: &'a OsStr) -> Result<&'a str> {
         .ok_or_else(|| anyhow!("{name} is not valid UTF-8"))
 }
 
+fn host_home() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
+}
+
 fn src_root() -> Result<PathBuf> {
-    let home = std::env::var_os("HOME").ok_or_else(|| anyhow!("HOME is not set"))?;
-    Ok(PathBuf::from(home).join("src"))
+    Ok(host_home()
+        .ok_or_else(|| anyhow!("HOME is not set"))?
+        .join("src"))
+}
+
+fn one_to_one_project_roots() -> Vec<PathBuf> {
+    match host_home() {
+        Some(home) => vec![home.join("projects"), home.join("temp")],
+        None => Vec::new(),
+    }
 }
 
 fn volume_spec(host: &Path, guest: &Path, options: Option<&str>) -> Result<OsString> {
@@ -784,6 +810,7 @@ fn host_timezone() -> Option<PathBuf> {
 fn guest_project_path(
     project_dir: &Path,
     src_root: Option<&Path>,
+    one_to_one_roots: &[PathBuf],
     username: &str,
 ) -> Result<(PathBuf, bool)> {
     if let Some(src_root) = src_root
@@ -796,6 +823,13 @@ fn guest_project_path(
             guest_src.join(rel_path)
         };
         return Ok((guest_path, false));
+    }
+
+    if one_to_one_roots
+        .iter()
+        .any(|root| project_dir.starts_with(root))
+    {
+        return Ok((project_dir.to_path_buf(), true));
     }
 
     let project_name = project_dir
@@ -862,6 +896,7 @@ mod tests {
             guest_project_path(
                 Path::new("/host/home/src/proj"),
                 Some(Path::new("/host/home/src")),
+                &[],
                 "alice"
             )
             .unwrap(),
@@ -873,8 +908,13 @@ mod tests {
     fn project_paths_under_src_preserve_non_utf8_components() {
         let project_dir = PathBuf::from(OsStr::from_bytes(b"/host/home/src/bad-\xff"));
 
-        let (guest_path, need_project_share) =
-            guest_project_path(&project_dir, Some(Path::new("/host/home/src")), "alice").unwrap();
+        let (guest_path, need_project_share) = guest_project_path(
+            &project_dir,
+            Some(Path::new("/host/home/src")),
+            &[],
+            "alice",
+        )
+        .unwrap();
 
         assert_eq!(
             guest_path.as_os_str().as_bytes(),
@@ -884,9 +924,45 @@ mod tests {
     }
 
     #[test]
+    fn project_paths_under_projects_or_temp_roots_are_mounted_one_to_one() {
+        let one_to_one_roots = vec![
+            PathBuf::from("/host/home/projects"),
+            PathBuf::from("/host/home/temp"),
+        ];
+
+        for root in &one_to_one_roots {
+            let project_dir = root.join("a/b/c/d/e/f");
+
+            assert_eq!(
+                guest_project_path(&project_dir, None, &one_to_one_roots, "alice").unwrap(),
+                (project_dir, true)
+            );
+        }
+    }
+
+    #[test]
+    fn one_to_one_project_paths_preserve_non_utf8_components() {
+        let project_dir = PathBuf::from(OsStr::from_bytes(b"/host/home/projects/a/bad-\xff/c"));
+
+        let (guest_path, need_project_share) = guest_project_path(
+            &project_dir,
+            None,
+            &[PathBuf::from("/host/home/projects")],
+            "alice",
+        )
+        .unwrap();
+
+        assert_eq!(
+            guest_path.as_os_str().as_bytes(),
+            b"/host/home/projects/a/bad-\xff/c"
+        );
+        assert!(need_project_share);
+    }
+
+    #[test]
     fn projects_under_src_are_mounted_separately_without_src_mount() {
         assert_eq!(
-            guest_project_path(Path::new("/host/home/src/proj"), None, "alice").unwrap(),
+            guest_project_path(Path::new("/host/home/src/proj"), None, &[], "alice").unwrap(),
             (PathBuf::from("/projects/proj"), true)
         );
     }
@@ -896,7 +972,7 @@ mod tests {
         let project_dir = PathBuf::from(OsStr::from_bytes(b"/host/home/bad-\xff"));
 
         let (guest_path, need_project_share) =
-            guest_project_path(&project_dir, None, "alice").unwrap();
+            guest_project_path(&project_dir, None, &[], "alice").unwrap();
 
         assert_eq!(guest_path.as_os_str().as_bytes(), b"/projects/bad-\xff");
         assert!(need_project_share);
