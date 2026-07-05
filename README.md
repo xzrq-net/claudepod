@@ -42,8 +42,8 @@ nix run github:xzrq-net/claudepod#gptpod
 ## Commands
 
 ```text
-claudepod [-s] [-V] [--sandbox-home DIR] [--host-port PORT|GUEST:HOST]... [-p PORT|HOST:GUEST]... [-v path] [-v host:guest]... [--] [command [arg]...]
-gptpod    [-s] [-V] [--sandbox-home DIR] [--host-port PORT|GUEST:HOST]... [-p PORT|HOST:GUEST]... [-v path] [-v host:guest]... [--] [command [arg]...]
+claudepod [-s] [-V] [--sandbox-home DIR] [--host-port PORT|GUEST:HOST[/udp]]... [-p PORT|HOST:GUEST[/udp]]... [-v path] [-v host:guest]... [--] [command [arg]...]
+gptpod    [-s] [-V] [--sandbox-home DIR] [--host-port PORT|GUEST:HOST[/udp]]... [-p PORT|HOST:GUEST[/udp]]... [-v path] [-v host:guest]... [--] [command [arg]...]
 ```
 
 Options:
@@ -57,10 +57,11 @@ Options:
 - `--host-port GUEST:HOST`: make guest `127.0.0.1:GUEST` connect to host
   `127.0.0.1:HOST`.
 - `-p PORT`, `--publish PORT`: publish guest port `PORT` on host
-  `127.0.0.1:PORT`.
+  `127.0.0.1:PORT`. The guest service may bind any address, including guest
+  `127.0.0.1`.
 - `-p HOST:GUEST`, `--publish HOST:GUEST`: publish guest port `GUEST` on host
-  `127.0.0.1:HOST`. The guest service should bind `0.0.0.0:GUEST` or the guest
-  interface address, not guest `127.0.0.1:GUEST`.
+  `127.0.0.1:HOST`.
+- Port specs default to TCP; append `/udp` for UDP (e.g. `-p 5353/udp`).
 - `-v path`: mount the same host path at the same guest path.
 - `-v host:guest`: mount a host path at a specific guest path.
   - Relative host paths in either form resolve against the current directory.

@@ -67,12 +67,14 @@ struct Args {
     #[arg(short = 'v', value_name = "SPEC")]
     extra_volumes: Vec<OsString>,
 
-    /// Forward guest localhost port to host localhost port: PORT or GUEST:HOST.
-    #[arg(long, value_name = "PORT|GUEST:HOST")]
+    /// Forward guest localhost port to host localhost port: PORT or GUEST:HOST,
+    /// with optional /udp suffix.
+    #[arg(long, value_name = "PORT|GUEST:HOST[/udp]")]
     host_port: Vec<PortMap>,
 
-    /// Publish a guest port on host localhost: PORT or HOST:GUEST.
-    #[arg(short = 'p', long, value_name = "PORT|HOST:GUEST")]
+    /// Publish a guest port on host localhost: PORT or HOST:GUEST, with
+    /// optional /udp suffix.
+    #[arg(short = 'p', long, value_name = "PORT|HOST:GUEST[/udp]")]
     publish: Vec<PortMap>,
 
     /// Use DIR as the guest home backing directory and do not mount host ~/src.
@@ -201,14 +203,18 @@ fn main() -> Result<()> {
     }
     for port in &args.host_port {
         println!(
-            "  Guest localhost:{} -> host localhost:{}",
-            port.left, port.right
+            "  Guest localhost:{} -> host localhost:{}{}",
+            port.left,
+            port.right,
+            port.proto.display_suffix()
         );
     }
     for port in &args.publish {
         println!(
-            "  Host localhost:{} -> guest port {}",
-            port.left, port.right
+            "  Host localhost:{} -> guest port {}{}",
+            port.left,
+            port.right,
+            port.proto.display_suffix()
         );
     }
     println!();
@@ -249,10 +255,8 @@ fn main() -> Result<()> {
     command
         .arg("--storage-opt")
         .arg(env_arg("overlay.mount_program", &fuse_overlayfs));
-    if !args.host_port.is_empty() {
-        command
-            .arg("--network")
-            .arg(pasta_tcp_ns_arg(&args.host_port));
+    if let Some(network) = pasta_network_arg(&args.host_port, !args.publish.is_empty()) {
+        command.arg("--network").arg(network);
     }
     for port in &args.publish {
         command.arg("-p").arg(publish_arg(port));
@@ -707,15 +711,37 @@ fn reject_colon_path(label: &str, path: &Path) -> Result<()> {
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum Proto {
+    Tcp,
+    Udp,
+}
+
+impl Proto {
+    fn display_suffix(self) -> &'static str {
+        match self {
+            Self::Tcp => "",
+            Self::Udp => " (udp)",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 struct PortMap {
     left: u16,
     right: u16,
+    proto: Proto,
 }
 
 impl FromStr for PortMap {
     type Err = String;
 
     fn from_str(spec: &str) -> std::result::Result<Self, Self::Err> {
+        let (spec, proto) = match spec.split_once('/') {
+            None => (spec, Proto::Tcp),
+            Some((spec, "tcp")) => (spec, Proto::Tcp),
+            Some((spec, "udp")) => (spec, Proto::Udp),
+            Some((_, proto)) => return Err(format!("{proto:?} is not \"tcp\" or \"udp\"")),
+        };
         if let Some((left, right)) = spec.split_once(':') {
             if right.contains(':') {
                 return Err("expected PORT or LEFT:RIGHT".to_string());
@@ -723,12 +749,14 @@ impl FromStr for PortMap {
             Ok(Self {
                 left: parse_port(left)?,
                 right: parse_port(right)?,
+                proto,
             })
         } else {
             let port = parse_port(spec)?;
             Ok(Self {
                 left: port,
                 right: port,
+                proto,
             })
         }
     }
@@ -737,7 +765,7 @@ impl FromStr for PortMap {
 fn parse_port(raw: &str) -> std::result::Result<u16, String> {
     let port: u16 = raw
         .parse()
-        .map_err(|_| format!("{raw:?} is not a valid TCP port"))?;
+        .map_err(|_| format!("{raw:?} is not a valid port"))?;
     if port == 0 {
         Err("port 0 is not supported".to_string())
     } else {
@@ -753,21 +781,34 @@ fn port_map_spec(port: &PortMap) -> String {
     }
 }
 
-fn pasta_tcp_ns_arg(ports: &[PortMap]) -> OsString {
-    let mut arg = String::from("pasta");
-    for (idx, port) in ports.iter().enumerate() {
-        if idx == 0 {
-            arg.push_str(":-T,");
-        } else {
-            arg.push_str(",-T,");
-        }
-        arg.push_str(&port_map_spec(port));
+/// Custom pasta options: `-T`/`-U` splice each --host-port back to the host,
+/// and --host-lo-to-ns-lo makes published ports reach guest services bound to
+/// the guest's loopback (podman's pasta backend does not pass it by default).
+fn pasta_network_arg(host_ports: &[PortMap], publishing: bool) -> Option<OsString> {
+    if host_ports.is_empty() && !publishing {
+        return None;
     }
-    OsString::from(arg)
+    let mut opts = Vec::new();
+    if publishing {
+        opts.push("--host-lo-to-ns-lo".to_string());
+    }
+    for port in host_ports {
+        let flag = match port.proto {
+            Proto::Tcp => "-T",
+            Proto::Udp => "-U",
+        };
+        opts.push(flag.to_string());
+        opts.push(port_map_spec(port));
+    }
+    Some(OsString::from(format!("pasta:{}", opts.join(","))))
 }
 
 fn publish_arg(port: &PortMap) -> String {
-    format!("127.0.0.1:{}:{}", port.left, port.right)
+    let proto = match port.proto {
+        Proto::Tcp => "",
+        Proto::Udp => "/udp",
+    };
+    format!("127.0.0.1:{}:{}{}", port.left, port.right, proto)
 }
 
 fn env_arg(name: &str, value: &OsStr) -> OsString {
@@ -841,9 +882,9 @@ fn guest_project_path(
 #[cfg(test)]
 mod tests {
     use super::{
-        NixRunRootsBuildInputs, PortMap, extra_volume_spec, guest_project_path,
+        NixRunRootsBuildInputs, PortMap, Proto, extra_volume_spec, guest_project_path,
         load_nix_run_roots_manifest, nix_run_roots_command, nix_run_roots_manifest_relative_path,
-        pasta_tcp_ns_arg, publish_arg, volume_spec, write_nix_run_roots_manifest_atomic,
+        pasta_network_arg, publish_arg, volume_spec, write_nix_run_roots_manifest_atomic,
     };
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
@@ -984,19 +1025,39 @@ mod tests {
             "3000".parse::<PortMap>().unwrap(),
             PortMap {
                 left: 3000,
-                right: 3000
+                right: 3000,
+                proto: Proto::Tcp,
             }
         );
         assert_eq!(
             "8080:3000".parse::<PortMap>().unwrap(),
             PortMap {
                 left: 8080,
-                right: 3000
+                right: 3000,
+                proto: Proto::Tcp,
+            }
+        );
+        assert_eq!(
+            "5353/udp".parse::<PortMap>().unwrap(),
+            PortMap {
+                left: 5353,
+                right: 5353,
+                proto: Proto::Udp,
+            }
+        );
+        assert_eq!(
+            "8080:3000/tcp".parse::<PortMap>().unwrap(),
+            PortMap {
+                left: 8080,
+                right: 3000,
+                proto: Proto::Tcp,
             }
         );
         assert!("0".parse::<PortMap>().is_err());
         assert!("8080:".parse::<PortMap>().is_err());
         assert!("1:2:3".parse::<PortMap>().is_err());
+        assert!("53/dns".parse::<PortMap>().is_err());
+        assert!("53/".parse::<PortMap>().is_err());
     }
 
     #[test]
@@ -1005,18 +1066,34 @@ mod tests {
             PortMap {
                 left: 15432,
                 right: 5432,
+                proto: Proto::Tcp,
             },
             PortMap {
                 left: 3000,
                 right: 3000,
+                proto: Proto::Tcp,
+            },
+            PortMap {
+                left: 51820,
+                right: 51820,
+                proto: Proto::Udp,
             },
         ];
         assert_eq!(
-            pasta_tcp_ns_arg(&ports),
-            OsStr::new("pasta:-T,15432:5432,-T,3000")
+            pasta_network_arg(&ports, false).unwrap(),
+            OsStr::new("pasta:-T,15432:5432,-T,3000,-U,51820")
         );
+        assert_eq!(
+            pasta_network_arg(&ports[..1], true).unwrap(),
+            OsStr::new("pasta:--host-lo-to-ns-lo,-T,15432:5432")
+        );
+        assert_eq!(
+            pasta_network_arg(&[], true).unwrap(),
+            OsStr::new("pasta:--host-lo-to-ns-lo")
+        );
+        assert_eq!(pasta_network_arg(&[], false), None);
         assert_eq!(publish_arg(&ports[0]), "127.0.0.1:15432:5432");
-        assert_eq!(publish_arg(&ports[1]), "127.0.0.1:3000:3000");
+        assert_eq!(publish_arg(&ports[2]), "127.0.0.1:51820:51820/udp");
     }
 
     #[test]
