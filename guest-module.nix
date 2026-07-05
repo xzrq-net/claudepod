@@ -224,6 +224,11 @@ in {
       firewall.enable = false;
       useHostResolvConf = false;
       resolvconf.enable = false;
+      # Drops "::1 localhost" from /etc/hosts: pasta splices --host-port on
+      # ::1 too, but host services usually listen only on 127.0.0.1, so
+      # clients that resolve localhost to ::1 first hang up instead of
+      # falling back to IPv4.
+      enableIPv6 = false;
     };
 
     environment.etc."resolv.conf".text = ''

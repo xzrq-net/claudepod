@@ -784,11 +784,14 @@ fn port_map_spec(port: &PortMap) -> String {
 /// Custom pasta options: `-T`/`-U` splice each --host-port back to the host,
 /// and --host-lo-to-ns-lo makes published ports reach guest services bound to
 /// the guest's loopback (podman's pasta backend does not pass it by default).
+/// `-4` keeps pasta off the guest's ::1 so a client that tries IPv6 loopback
+/// first gets an instant refusal and falls back to 127.0.0.1, instead of a
+/// spliced connection that dies against a host service listening only on IPv4.
 fn pasta_network_arg(host_ports: &[PortMap], publishing: bool) -> Option<OsString> {
     if host_ports.is_empty() && !publishing {
         return None;
     }
-    let mut opts = Vec::new();
+    let mut opts = vec!["-4".to_string()];
     if publishing {
         opts.push("--host-lo-to-ns-lo".to_string());
     }
@@ -1081,15 +1084,15 @@ mod tests {
         ];
         assert_eq!(
             pasta_network_arg(&ports, false).unwrap(),
-            OsStr::new("pasta:-T,15432:5432,-T,3000,-U,51820")
+            OsStr::new("pasta:-4,-T,15432:5432,-T,3000,-U,51820")
         );
         assert_eq!(
             pasta_network_arg(&ports[..1], true).unwrap(),
-            OsStr::new("pasta:--host-lo-to-ns-lo,-T,15432:5432")
+            OsStr::new("pasta:-4,--host-lo-to-ns-lo,-T,15432:5432")
         );
         assert_eq!(
             pasta_network_arg(&[], true).unwrap(),
-            OsStr::new("pasta:--host-lo-to-ns-lo")
+            OsStr::new("pasta:-4,--host-lo-to-ns-lo")
         );
         assert_eq!(pasta_network_arg(&[], false), None);
         assert_eq!(publish_arg(&ports[0]), "127.0.0.1:15432:5432");
