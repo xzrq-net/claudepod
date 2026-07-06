@@ -22,6 +22,7 @@ const TIMEZONE_ENV: &str = "CLAUDEPOD_TIMEZONE";
 const STORE_LAYERS_FILE: &str = "/run/claudepod-store-layers";
 const TOPLEVEL_FILE: &str = "/run/claudepod-toplevel";
 const STORE_LAYER_MOUNT_DIR: &str = "/nix/.l";
+const DEV_SHM_SIZE: &str = "1g";
 const NIX_RUN_ROOTS_EXPR: &str = r#"
 let
   nixpkgs = /. + builtins.getEnv "CLAUDEPOD_NIXPKGS";
@@ -245,6 +246,8 @@ fn main() -> Result<()> {
         "--no-hosts",
         "--dns=none",
         "--pids-limit=16384",
+        "--shm-size",
+        DEV_SHM_SIZE,
         "--security-opt",
         "unmask=ALL",
     ]);
