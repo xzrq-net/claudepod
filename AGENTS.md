@@ -1,3 +1,6 @@
+`claudepod` is a Nix Home Manager module that builds and runs a tiny sandbox
+container for the purpose of running coding agents.
+
 # Agent notes
 
 ## nix-proxy maintenance
