@@ -2,7 +2,7 @@ use std::ffi::{OsStr, OsString};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::os::fd::AsRawFd;
-use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::os::unix::net::UnixListener;
 use std::os::unix::process::CommandExt;
@@ -67,6 +67,10 @@ struct Args {
     #[arg(short = 'v', value_name = "SPEC")]
     extra_volumes: Vec<OsString>,
 
+    /// Set an environment variable in the guest session: NAME or NAME=VALUE.
+    #[arg(short = 'e', long, value_name = "NAME[=VALUE]")]
+    env: Vec<OsString>,
+
     /// Forward guest localhost port to host localhost port: PORT or GUEST:HOST,
     /// with optional /udp suffix.
     #[arg(long, value_name = "PORT|GUEST:HOST[/udp]")]
@@ -92,6 +96,7 @@ struct Args {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    let env = parse_env_specs(&args.env)?;
 
     let command_name = command_name();
     let toplevel = toplevel()?;
@@ -188,12 +193,6 @@ fn main() -> Result<()> {
         volumes.push(extra_volume_spec(spec)?);
     }
 
-    let mut env_names = std::env::vars_os()
-        .filter(|(name, value)| claudepod::agent_env::forwarded(name, value))
-        .map(|(name, _value)| name)
-        .collect::<Vec<_>>();
-    env_names.sort();
-
     println!("Starting {}...", command_name.to_string_lossy());
     println!("  Host path: {}", project_dir.display());
     println!("  Guest path: {}", guest_path.display());
@@ -264,8 +263,14 @@ fn main() -> Result<()> {
     for volume in volumes {
         command.arg("-v").arg(volume);
     }
-    for name in env_names {
-        command.arg("-e").arg(name);
+    for spec in &env {
+        command.arg("-e").arg(spec.arg());
+    }
+    if !env.is_empty() {
+        command.arg("-e").arg(env_arg(
+            claudepod::agent_env::NAMES_ENV,
+            &join_env_names(&env),
+        ));
     }
     if args.verbose {
         command.arg("-e").arg("CLAUDEPOD_VERBOSE=1");
@@ -814,6 +819,64 @@ fn publish_arg(port: &PortMap) -> String {
     format!("127.0.0.1:{}:{}{}", port.left, port.right, proto)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EnvSpec {
+    arg: OsString,
+    name: OsString,
+}
+
+impl EnvSpec {
+    fn arg(&self) -> &OsStr {
+        &self.arg
+    }
+
+    fn name(&self) -> &OsStr {
+        &self.name
+    }
+}
+
+fn parse_env_specs(specs: &[OsString]) -> Result<Vec<EnvSpec>> {
+    specs
+        .iter()
+        .map(|spec| parse_env_spec(spec))
+        .collect::<Result<Vec<_>>>()
+}
+
+fn parse_env_spec(spec: &OsStr) -> Result<EnvSpec> {
+    let bytes = spec.as_bytes();
+    let name_bytes = bytes
+        .splitn(2, |byte| *byte == b'=')
+        .next()
+        .expect("splitn always yields one item");
+    let name = OsString::from_vec(name_bytes.to_vec());
+
+    if !claudepod::agent_env::is_shell_identifier(&name) {
+        bail!(
+            "invalid -e {}: variable name must be a shell identifier",
+            spec.to_string_lossy()
+        );
+    }
+    if name == claudepod::agent_env::NAMES_ENV {
+        bail!("invalid -e {}: name is reserved", spec.to_string_lossy());
+    }
+
+    Ok(EnvSpec {
+        arg: spec.to_owned(),
+        name,
+    })
+}
+
+fn join_env_names(specs: &[EnvSpec]) -> OsString {
+    let mut out = Vec::new();
+    for spec in specs {
+        if !out.is_empty() {
+            out.push(b'\n');
+        }
+        out.extend_from_slice(spec.name().as_bytes());
+    }
+    OsString::from_vec(out)
+}
+
 fn env_arg(name: &str, value: &OsStr) -> OsString {
     let mut arg = OsString::from(name);
     arg.push("=");
@@ -886,10 +949,11 @@ fn guest_project_path(
 mod tests {
     use super::{
         NixRunRootsBuildInputs, PortMap, Proto, extra_volume_spec, guest_project_path,
-        load_nix_run_roots_manifest, nix_run_roots_command, nix_run_roots_manifest_relative_path,
-        pasta_network_arg, publish_arg, volume_spec, write_nix_run_roots_manifest_atomic,
+        join_env_names, load_nix_run_roots_manifest, nix_run_roots_command,
+        nix_run_roots_manifest_relative_path, parse_env_specs, pasta_network_arg, publish_arg,
+        volume_spec, write_nix_run_roots_manifest_atomic,
     };
-    use std::ffi::OsStr;
+    use std::ffi::{OsStr, OsString};
     use std::os::unix::ffi::OsStrExt;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1097,6 +1161,33 @@ mod tests {
         assert_eq!(pasta_network_arg(&[], false), None);
         assert_eq!(publish_arg(&ports[0]), "127.0.0.1:15432:5432");
         assert_eq!(publish_arg(&ports[2]), "127.0.0.1:51820:51820/udp");
+    }
+
+    #[test]
+    fn env_specs_accept_name_or_assignment() {
+        let specs = [
+            OsString::from("FOO"),
+            OsString::from("BAR=baz=qux"),
+            OsString::from("EMPTY="),
+        ];
+
+        let env = parse_env_specs(&specs).unwrap();
+
+        assert_eq!(env[0].arg(), OsStr::new("FOO"));
+        assert_eq!(env[0].name(), OsStr::new("FOO"));
+        assert_eq!(env[1].arg(), OsStr::new("BAR=baz=qux"));
+        assert_eq!(env[1].name(), OsStr::new("BAR"));
+        assert_eq!(env[2].arg(), OsStr::new("EMPTY="));
+        assert_eq!(env[2].name(), OsStr::new("EMPTY"));
+        assert_eq!(join_env_names(&env).as_bytes(), b"FOO\nBAR\nEMPTY");
+    }
+
+    #[test]
+    fn env_specs_reject_unsourceable_or_reserved_names() {
+        assert!(parse_env_specs(&[OsString::from("")]).is_err());
+        assert!(parse_env_specs(&[OsString::from("BAD-NAME=x")]).is_err());
+        assert!(parse_env_specs(&[OsString::from("1BAD=x")]).is_err());
+        assert!(parse_env_specs(&[OsString::from(claudepod::agent_env::NAMES_ENV)]).is_err());
     }
 
     #[test]

@@ -1,13 +1,9 @@
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 
-pub fn forwarded(name: &OsStr, value: &OsStr) -> bool {
-    is_shell_identifier(name)
-        && (name.as_bytes().starts_with(b"CLAUDE_CODE_")
-            || (name == "MAX_THINKING_TOKENS" && !value.is_empty()))
-}
+pub const NAMES_ENV: &str = "CLAUDEPOD_AGENT_ENV_NAMES";
 
-fn is_shell_identifier(name: &OsStr) -> bool {
+pub fn is_shell_identifier(name: &OsStr) -> bool {
     let bytes = name.as_bytes();
     let Some((&first, rest)) = bytes.split_first() else {
         return false;
@@ -25,23 +21,17 @@ fn is_shell_identifier_char(byte: u8) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::forwarded;
+    use super::is_shell_identifier;
     use std::ffi::OsStr;
 
     #[test]
-    fn forwards_only_agent_env_with_shell_safe_names() {
-        assert!(forwarded(OsStr::new("CLAUDE_CODE_TOKEN"), OsStr::new("x")));
-        assert!(forwarded(
-            OsStr::new("MAX_THINKING_TOKENS"),
-            OsStr::new("1")
-        ));
+    fn shell_identifiers_are_sourceable_by_bash() {
+        assert!(is_shell_identifier(OsStr::new("FOO")));
+        assert!(is_shell_identifier(OsStr::new("FOO_BAR")));
+        assert!(is_shell_identifier(OsStr::new("_X1")));
 
-        assert!(!forwarded(
-            OsStr::new("MAX_THINKING_TOKENS"),
-            OsStr::new("")
-        ));
-        assert!(!forwarded(OsStr::new("CLAUDE-CODE-TOKEN"), OsStr::new("x")));
-        assert!(!forwarded(OsStr::new("CLAUDE_CODE-BAD"), OsStr::new("x")));
-        assert!(!forwarded(OsStr::new("PATH"), OsStr::new("x")));
+        assert!(!is_shell_identifier(OsStr::new("")));
+        assert!(!is_shell_identifier(OsStr::new("1BAD")));
+        assert!(!is_shell_identifier(OsStr::new("BAD-NAME")));
     }
 }

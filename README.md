@@ -42,8 +42,8 @@ nix run github:xzrq-net/claudepod#gptpod
 ## Commands
 
 ```text
-claudepod [-s] [-V] [--sandbox-home DIR] [--host-port PORT|GUEST:HOST[/udp]]... [-p PORT|HOST:GUEST[/udp]]... [-v path] [-v host:guest]... [--] [command [arg]...]
-gptpod    [-s] [-V] [--sandbox-home DIR] [--host-port PORT|GUEST:HOST[/udp]]... [-p PORT|HOST:GUEST[/udp]]... [-v path] [-v host:guest]... [--] [command [arg]...]
+claudepod [-s] [-V] [--sandbox-home DIR] [-e NAME[=VALUE]]... [--host-port PORT|GUEST:HOST[/udp]]... [-p PORT|HOST:GUEST[/udp]]... [-v path] [-v host:guest]... [--] [command [arg]...]
+gptpod    [-s] [-V] [--sandbox-home DIR] [-e NAME[=VALUE]]... [--host-port PORT|GUEST:HOST[/udp]]... [-p PORT|HOST:GUEST[/udp]]... [-v path] [-v host:guest]... [--] [command [arg]...]
 ```
 
 Options:
@@ -52,6 +52,10 @@ Options:
 - `-V`: verbose mode, shows systemd boot messages in the guest.
 - `--sandbox-home DIR`: use `DIR` as the guest home backing directory and do not
   mount host `~/src`. The current directory is still mounted as the project.
+- `-e NAME`, `--env NAME`: forward `NAME` from the host environment into the
+  guest session when it is set.
+- `-e NAME=VALUE`, `--env NAME=VALUE`: set `NAME` to `VALUE` in the guest
+  session.
 - `--host-port PORT`: make guest `127.0.0.1:PORT` connect to host
   `127.0.0.1:PORT`.
 - `--host-port GUEST:HOST`: make guest `127.0.0.1:GUEST` connect to host
@@ -68,10 +72,8 @@ Options:
 - `command [arg]...`: run this command in the project directory instead of the
   default agent or shell.
 
-Environment variables:
-
-- `CLAUDE_CODE_*`: forwarded into the guest session process.
-- `MAX_THINKING_TOKENS`: forwarded the same way when set.
+Environment variables are not forwarded into the guest session unless selected
+with `-e` / `--env`.
 
 Builtin paths:
 

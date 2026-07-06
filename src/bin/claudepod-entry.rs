@@ -5,12 +5,13 @@
 //!
 //! Configuration arrives via environment variables set by claudepod-start
 //! (CLAUDEPOD_TOPLEVEL, CLAUDEPOD_USERNAME, CLAUDEPOD_PROJECT_PATH,
-//! CLAUDEPOD_MODE, CLAUDEPOD_TIMEZONE, CLAUDEPOD_VERBOSE,
-//! CLAUDE_CODE_*); the agent command arrives as argv.
+//! CLAUDEPOD_MODE, CLAUDEPOD_TIMEZONE, CLAUDEPOD_VERBOSE, and explicit
+//! agent environment selected by claudepod-start); the agent command arrives
+//! as argv.
 
 use std::ffi::{OsStr, OsString};
 use std::fmt::Write as _;
-use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::symlink;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -115,7 +116,7 @@ fn setup_localtime() -> Result<()> {
         .with_context(|| format!("create /etc/localtime -> {}", target.display()))
 }
 
-/// Project path, mode, agent command, and forwarded environment, written
+/// Project path, mode, agent command, and explicit agent environment, written
 /// under /run where the claudepod-shell unit picks them up across the
 /// systemd boundary.
 fn write_runtime_config(
@@ -169,8 +170,8 @@ fn write_runtime_config(
     // The guest service reads this via `set -a; . file; set +a`, so values
     // are bash single-quoted.
     let mut env = Vec::new();
-    for (name, value) in std::env::vars_os() {
-        if claudepod::agent_env::forwarded(&name, &value) {
+    for name in agent_env_names()? {
+        if let Some(value) = std::env::var_os(&name) {
             append_env_line(&mut env, &name, &value);
         }
     }
@@ -187,6 +188,31 @@ fn write_runtime_config(
     }
 
     Ok(())
+}
+
+fn agent_env_names() -> Result<Vec<OsString>> {
+    let raw = std::env::var_os(claudepod::agent_env::NAMES_ENV);
+    agent_env_names_from_raw(raw.as_deref())
+}
+
+fn agent_env_names_from_raw(raw: Option<&OsStr>) -> Result<Vec<OsString>> {
+    let Some(raw) = raw.filter(|raw| !raw.is_empty()) else {
+        return Ok(Vec::new());
+    };
+
+    let mut names = Vec::new();
+    for name_bytes in raw.as_bytes().split(|byte| *byte == b'\n') {
+        let name = OsString::from_vec(name_bytes.to_vec());
+        if !claudepod::agent_env::is_shell_identifier(&name) {
+            bail!(
+                "{} contains invalid variable name {}",
+                claudepod::agent_env::NAMES_ENV,
+                name.to_string_lossy()
+            );
+        }
+        names.push(name);
+    }
+    Ok(names)
 }
 
 fn append_env_line(out: &mut Vec<u8>, name: &OsStr, value: &OsStr) {
@@ -258,7 +284,9 @@ fn parse_map_field(field: Option<&str>, line_no: usize, name: &str) -> Result<u6
 
 #[cfg(test)]
 mod tests {
-    use super::subid_file_from_map;
+    use super::{agent_env_names_from_raw, append_env_line, subid_file_from_map};
+    use std::ffi::{OsStr, OsString};
+    use std::os::unix::ffi::OsStrExt;
 
     #[test]
     fn subid_file_from_outer_keep_id_map() {
@@ -294,5 +322,26 @@ mod tests {
         assert!(subid_file_from_map("0 100000\n").is_err());
         assert!(subid_file_from_map("0 100000 1 extra\n").is_err());
         assert!(subid_file_from_map("0 nope 1\n").is_err());
+    }
+
+    #[test]
+    fn agent_env_names_parse_newline_list() {
+        assert_eq!(
+            agent_env_names_from_raw(None).unwrap(),
+            Vec::<OsString>::new()
+        );
+        assert_eq!(
+            agent_env_names_from_raw(Some(OsStr::new("FOO\nBAR"))).unwrap(),
+            [OsString::from("FOO"), OsString::from("BAR")]
+        );
+        assert!(agent_env_names_from_raw(Some(OsStr::new("BAD-NAME"))).is_err());
+    }
+
+    #[test]
+    fn env_lines_are_sourceable_by_bash() {
+        let mut out = Vec::new();
+        append_env_line(&mut out, OsStr::new("FOO"), OsStr::from_bytes(b"a'b\nc"));
+
+        assert_eq!(out, b"FOO='a'\\''b\nc'\n");
     }
 }
