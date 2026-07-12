@@ -106,6 +106,7 @@ in {
     # create /etc/machine-id on podman's fuse-overlayfs rootfs and fsync() it
     # synchronously before boot can continue.
     environment.etc."machine-id".text = "4ecb2502507f468986747b937d700a13\n";
+    environment.sessionVariables.CLAUDE_CODE_DISABLE_BG_SHELL_PRESSURE_REAP = "1";
     networking.hostName = "claudepod";
 
     systemd.services.console-getty.enable = false;
