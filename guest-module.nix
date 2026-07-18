@@ -31,25 +31,31 @@
     . /run/claudepod-env
     set +a
 
-    if [ "''${#COMMAND[@]}" -gt 0 ]; then
-      exec ${pkgs.bashInteractive}/bin/bash --login -c 'cd "$1" && { eval "$(${pkgs.direnv}/bin/direnv export bash)" || true; } && shift && exec "$@"' claudepod "$PROJECT" "''${COMMAND[@]}"
+    if [ "''${#COMMAND[@]}" -eq 0 ]; then
+      case "$MODE" in
+        shell)
+          cd "$PROJECT"
+          exec ${pkgs.bashInteractive}/bin/bash --login
+          ;;
+        claude)
+          COMMAND=(claude --dangerously-skip-permissions)
+          ;;
+        codex)
+          COMMAND=(${pkgs.nodejs}/bin/npx -y @openai/codex --sandbox danger-full-access --ask-for-approval never)
+          ;;
+        *)
+          echo "Unknown claudepod mode: $MODE" >&2
+          exit 1
+          ;;
+      esac
     fi
 
-    case "$MODE" in
-      shell)
-        exec ${pkgs.bashInteractive}/bin/bash --login
-        ;;
-      claude)
-        exec ${pkgs.bashInteractive}/bin/bash --login -c 'cd "$1" && { eval "$(${pkgs.direnv}/bin/direnv export bash)" || true; } && exec claude --dangerously-skip-permissions' claudepod "$PROJECT"
-        ;;
-      codex)
-        exec ${pkgs.bashInteractive}/bin/bash --login -c 'cd "$1" && { eval "$(${pkgs.direnv}/bin/direnv export bash)" || true; } && exec ${pkgs.nodejs}/bin/npx -y @openai/codex --sandbox danger-full-access --ask-for-approval never' claudepod "$PROJECT"
-        ;;
-      *)
-        echo "Unknown claudepod mode: $MODE" >&2
-        exit 1
-        ;;
-    esac
+    exec ${pkgs.bashInteractive}/bin/bash --login -c '
+      cd "$1"
+      eval "$(${pkgs.direnv}/bin/direnv export bash)" || true
+      shift
+      exec "$@"
+    ' claudepod "$PROJECT" "''${COMMAND[@]}"
   '';
 
   claudepodRuntimeUser = pkgs.writeShellScript "claudepod-runtime-user" ''
@@ -210,10 +216,6 @@ in {
         enable = true;
         nix-direnv.enable = true;
       };
-
-      bash.interactiveShellInit = ''
-        cd "$(${pkgs.coreutils}/bin/cat /run/claudepod-project)"
-      '';
     };
 
     services.logrotate.enable = false;
