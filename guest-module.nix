@@ -15,6 +15,28 @@
     ln -s ${nixIndexPackages.nix-index-with-db}/bin/nix-locate $out/bin/nix-locate
   '';
 
+  # Per-command devshell loader: re-evaluates direnv against the current cwd
+  # before each agent shell command, so devshell changes land without
+  # restarting the agent session. Wired into Claude Code via the SessionStart
+  # hook in /etc/claude-code/managed-settings.json (sourced through
+  # CLAUDE_ENV_FILE) and into codex via /etc/profile (codex runs `bash -lc`).
+  # Failure modes are loud on stderr but never fail the shell.
+  agentDevshell = pkgs.writeText "agent-devshell.sh" ''
+    if command -v direnv >/dev/null 2>&1; then
+      _de_out=$(timeout 60 direnv export bash 2>/dev/null); _de_rc=$?
+      eval "$_de_out"
+      if [ "$_de_rc" -eq 124 ]; then
+        echo "[devshell] direnv eval timed out (60s); run 'direnv reload' to rebuild the env" >&2
+      elif [ "$_de_rc" -ne 0 ]; then
+        echo "[devshell] direnv failed; running with base env (blocked .envrc? run 'direnv allow'; or broken shellHook)" >&2
+      elif [ -n "''${NIX_DIRENV_DID_FALLBACK:-}" ]; then
+        echo "[devshell] flake eval FAILED; using last good devshell env — fix flake.nix" >&2
+      fi
+      unset _de_out _de_rc
+    fi
+    true
+  '';
+
   claudepodShell = pkgs.writeShellScript "claudepod-shell" ''
     set -euo pipefail
 
@@ -207,6 +229,11 @@ in {
       ++ cfg.extraGuestPackages pkgs;
 
     programs = {
+      # codex runs each command with `bash -lc`, so /etc/profile is its
+      # per-command hook point. Claude Code's Bash tool shells are non-login
+      # and are covered by the CLAUDE_ENV_FILE hook instead.
+      bash.loginShellInit = "source /etc/agent-devshell.sh";
+
       nix-ld.enable = true;
       nix-index.package = nixIndexPackages.nix-index-with-small-db;
 
@@ -232,6 +259,24 @@ in {
       # clients that resolve localhost to ::1 first hang up instead of
       # falling back to IPv4.
       enableIPv6 = false;
+    };
+
+    environment.etc."agent-devshell.sh".source = agentDevshell;
+
+    # Claude Code sources $CLAUDE_ENV_FILE before each Bash tool command;
+    # pointing it at the loader gives per-command direnv. Managed settings so
+    # it holds regardless of what lives in the mutable guest home.
+    environment.etc."claude-code/managed-settings.json".text = builtins.toJSON {
+      hooks.SessionStart = [
+        {
+          hooks = [
+            {
+              type = "command";
+              command = "echo 'source /etc/agent-devshell.sh' >> \"$CLAUDE_ENV_FILE\"";
+            }
+          ];
+        }
+      ];
     };
 
     environment.etc."resolv.conf".text = ''
