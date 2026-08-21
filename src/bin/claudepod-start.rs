@@ -22,6 +22,10 @@ const TIMEZONE_ENV: &str = "CLAUDEPOD_TIMEZONE";
 const STORE_LAYERS_FILE: &str = "/run/claudepod-store-layers";
 const TOPLEVEL_FILE: &str = "/run/claudepod-toplevel";
 const STORE_LAYER_MOUNT_DIR: &str = "/nix/.l";
+// NixOS's host-driver discovery path: a symlink into the store path holding the
+// running kernel module's userspace libs (libcuda.so.1 and friends).
+const OPENGL_DRIVER_DIR: &str = "/run/opengl-driver";
+const OPENGL_DRIVER_ENV: &str = "LD_LIBRARY_PATH=/run/opengl-driver/lib";
 const DEV_SHM_SIZE: &str = "2g";
 const NIX_RUN_ROOTS_EXPR: &str = r#"
 let
@@ -86,6 +90,11 @@ struct Args {
     #[arg(long, value_name = "DIR")]
     sandbox_home: Option<PathBuf>,
 
+    /// Pass the host NVIDIA GPU(s) into the guest: /dev/nvidia* device nodes,
+    /// read-only /run/opengl-driver, and LD_LIBRARY_PATH pointing at its lib dir.
+    #[arg(long)]
+    gpu: bool,
+
     /// Build the nix run-root manifest cache before starting.
     #[arg(long)]
     build_nix_run_roots: bool,
@@ -97,7 +106,18 @@ struct Args {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let env = parse_env_specs(&args.env)?;
+    let mut env = parse_env_specs(&args.env)?;
+    let gpu_devices = if args.gpu {
+        let devices = nvidia_device_nodes(Path::new("/dev"))?;
+        if !Path::new(OPENGL_DRIVER_DIR).is_dir() {
+            bail!("--gpu: {OPENGL_DRIVER_DIR} not found");
+        }
+        // First, so user -e LD_LIBRARY_PATH overrides it when sourced.
+        env.insert(0, parse_env_spec(OsStr::new(OPENGL_DRIVER_ENV))?);
+        devices
+    } else {
+        Vec::new()
+    };
 
     let command_name = command_name();
     let toplevel = toplevel()?;
@@ -190,6 +210,10 @@ fn main() -> Result<()> {
     if need_project_share {
         volumes.push(volume_spec(&project_dir, &guest_path, None)?);
     }
+    if args.gpu {
+        let dir = Path::new(OPENGL_DRIVER_DIR);
+        volumes.push(volume_spec(dir, dir, Some("ro"))?);
+    }
     for spec in &args.extra_volumes {
         volumes.push(extra_volume_spec(spec)?);
     }
@@ -216,6 +240,13 @@ fn main() -> Result<()> {
             port.right,
             port.proto.display_suffix()
         );
+    }
+    if args.gpu {
+        let names: Vec<_> = gpu_devices
+            .iter()
+            .map(|device| device.to_string_lossy())
+            .collect();
+        println!("  GPU: {}", names.join(" "));
     }
     println!();
 
@@ -257,6 +288,9 @@ fn main() -> Result<()> {
     command
         .arg("--storage-opt")
         .arg(env_arg("overlay.mount_program", &fuse_overlayfs));
+    for device in &gpu_devices {
+        command.arg("--device").arg(device);
+    }
     if let Some(network) = pasta_network_arg(&args.host_port, !args.publish.is_empty()) {
         command.arg("--network").arg(network);
     }
@@ -701,6 +735,40 @@ fn extra_volume_spec(spec: &OsStr) -> Result<OsString> {
     Ok(out)
 }
 
+/// NVIDIA device nodes to pass through: the control/UVM nodes plus one per
+/// GPU. Rootless podman enforces no device cgroup, so passthrough is just a
+/// bind; the nodes are world-rw on the host.
+fn nvidia_device_nodes(dev: &Path) -> Result<Vec<PathBuf>> {
+    let mut devices = Vec::new();
+    for name in ["nvidiactl", "nvidia-uvm", "nvidia-uvm-tools"] {
+        let path = dev.join(name);
+        if !path.exists() {
+            bail!(
+                "--gpu: {} not found (NVIDIA driver loaded?)",
+                path.display()
+            );
+        }
+        devices.push(path);
+    }
+    let mut gpus: Vec<PathBuf> = dev
+        .read_dir()
+        .with_context(|| format!("read {}", dev.display()))?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.strip_prefix("nvidia"))
+                .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
+        })
+        .collect();
+    if gpus.is_empty() {
+        bail!("--gpu: no {}/nvidia[0-9]* device nodes", dev.display());
+    }
+    gpus.sort();
+    devices.extend(gpus);
+    Ok(devices)
+}
+
 fn rootfs_spec(rootfs_dir: &Path) -> Result<OsString> {
     reject_colon_path("rootfs", rootfs_dir)?;
     let mut spec = OsString::from(rootfs_dir.as_os_str());
@@ -953,8 +1021,8 @@ mod tests {
     use super::{
         NixRunRootsBuildInputs, PortMap, Proto, extra_volume_spec, guest_project_path,
         join_env_names, load_nix_run_roots_manifest, nix_run_roots_command,
-        nix_run_roots_manifest_relative_path, parse_env_specs, pasta_network_arg, publish_arg,
-        volume_spec, write_nix_run_roots_manifest_atomic,
+        nix_run_roots_manifest_relative_path, nvidia_device_nodes, parse_env_specs,
+        pasta_network_arg, publish_arg, volume_spec, write_nix_run_roots_manifest_atomic,
     };
     use std::ffi::{OsStr, OsString};
     use std::os::unix::ffi::OsStrExt;
@@ -1336,6 +1404,40 @@ mod tests {
             })
             .is_err()
         );
+    }
+
+    #[test]
+    fn nvidia_device_nodes_require_control_nodes_and_one_gpu() {
+        let dev = temp_test_dir("nvidia-dev");
+        for name in ["nvidiactl", "nvidia-uvm", "nvidia-uvm-tools"] {
+            std::fs::write(dev.join(name), b"").unwrap();
+        }
+        assert!(nvidia_device_nodes(&dev).is_err());
+
+        for name in [
+            "nvidia1",
+            "nvidia0",
+            "nvidia-modeset",
+            "nvidia-caps",
+            "nvidia0x",
+        ] {
+            std::fs::write(dev.join(name), b"").unwrap();
+        }
+        assert_eq!(
+            nvidia_device_nodes(&dev).unwrap(),
+            [
+                "nvidiactl",
+                "nvidia-uvm",
+                "nvidia-uvm-tools",
+                "nvidia0",
+                "nvidia1"
+            ]
+            .map(|name| dev.join(name))
+        );
+
+        std::fs::remove_file(dev.join("nvidia-uvm")).unwrap();
+        assert!(nvidia_device_nodes(&dev).is_err());
+        std::fs::remove_dir_all(&dev).unwrap();
     }
 
     fn temp_test_dir(name: &str) -> PathBuf {

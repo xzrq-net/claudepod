@@ -42,8 +42,8 @@ nix run github:xzrq-net/claudepod#gptpod
 ## Commands
 
 ```text
-claudepod [-s] [-V] [--sandbox-home DIR] [-e NAME[=VALUE]]... [--host-port PORT|GUEST:HOST[/udp]]... [-p PORT|HOST:GUEST[/udp]]... [-v path] [-v host:guest]... [--] [command [arg]...]
-gptpod    [-s] [-V] [--sandbox-home DIR] [-e NAME[=VALUE]]... [--host-port PORT|GUEST:HOST[/udp]]... [-p PORT|HOST:GUEST[/udp]]... [-v path] [-v host:guest]... [--] [command [arg]...]
+claudepod [-s] [-V] [--sandbox-home DIR] [--gpu] [-e NAME[=VALUE]]... [--host-port PORT|GUEST:HOST[/udp]]... [-p PORT|HOST:GUEST[/udp]]... [-v path] [-v host:guest]... [--] [command [arg]...]
+gptpod    [-s] [-V] [--sandbox-home DIR] [--gpu] [-e NAME[=VALUE]]... [--host-port PORT|GUEST:HOST[/udp]]... [-p PORT|HOST:GUEST[/udp]]... [-v path] [-v host:guest]... [--] [command [arg]...]
 ```
 
 Options:
@@ -52,6 +52,13 @@ Options:
 - `-V`: verbose mode, shows systemd boot messages in the guest.
 - `--sandbox-home DIR`: use `DIR` as the guest home backing directory and do not
   mount host `~/src`. The current directory is still mounted as the project.
+- `--gpu`: pass the host NVIDIA GPU(s) into the guest. Binds `/dev/nvidiactl`,
+  `/dev/nvidia-uvm*`, `/dev/nvidia[0-9]*` and read-only `/run/opengl-driver`,
+  and sets `LD_LIBRARY_PATH=/run/opengl-driver/lib` so non-Nix-built binaries
+  find `libcuda.so.1`. Nix-built CUDA packages already have that dir in their
+  RUNPATH. Note the guest Nix store is tmpfs: put CUDA toolchains in
+  `extraGuestPackages` (or build them on the host) rather than fetching them
+  per session.
 - `-e NAME`, `--env NAME`: forward `NAME` from the host environment into the
   guest session when it is set.
 - `-e NAME=VALUE`, `--env NAME=VALUE`: set `NAME` to `VALUE` in the guest
