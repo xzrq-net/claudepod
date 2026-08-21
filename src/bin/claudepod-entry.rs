@@ -5,9 +5,9 @@
 //!
 //! Configuration arrives via environment variables set by claudepod-start
 //! (CLAUDEPOD_TOPLEVEL, CLAUDEPOD_USERNAME, CLAUDEPOD_PROJECT_PATH,
-//! CLAUDEPOD_MODE, CLAUDEPOD_TIMEZONE, CLAUDEPOD_VERBOSE, and explicit
-//! agent environment selected by claudepod-start); the agent command arrives
-//! as argv.
+//! CLAUDEPOD_MODE, CLAUDEPOD_TIMEZONE, CLAUDEPOD_VERBOSE, CLAUDEPOD_USB, and
+//! explicit agent environment selected by claudepod-start); the agent command
+//! arrives as argv.
 
 use std::ffi::{OsStr, OsString};
 use std::fmt::Write as _;
@@ -25,6 +25,15 @@ const RUNTIME_UID: u64 = 1000;
 const SUBID_DELEGATE_START: u64 = RUNTIME_UID + 1;
 const TIMEZONE_ENV: &str = "CLAUDEPOD_TIMEZONE";
 const STORE_UPPER_DIR: &str = "/nix/.rw-store/store";
+const USB_ENV: &str = "CLAUDEPOD_USB";
+// Host /dev is bound here by claudepod-start --usb. USB class drivers create
+// nodes directly in /dev with a fixed name and a hotplug-assigned number, so
+// the canonical names below are pre-linked into the live host tree.
+const HOST_DEV_SUBDIR: &str = "host";
+const USB_DEVICE_CLASSES: [&str; 2] = ["hidraw", "ttyUSB"];
+// Kernel HIDRAW_MAX_DEVICES; a desktop with a few HID devices and Bluetooth
+// peripherals already sits in the 20s.
+const USB_DEVICE_LINKS_PER_CLASS: u32 = 64;
 
 fn main() {
     if let Err(err) = run() {
@@ -42,6 +51,9 @@ fn run() -> Result<()> {
     write_runtime_config(&system, &username, &command, &descendant_store_layers)
         .context("write runtime config")?;
     setup_localtime().context("setup localtime")?;
+    if std::env::var_os(USB_ENV).is_some_and(|v| !v.is_empty()) {
+        create_usb_device_links(Path::new("/dev")).context("create USB device links")?;
+    }
 
     let mut init_path = system;
     init_path.push("/init");
@@ -114,6 +126,23 @@ fn setup_localtime() -> Result<()> {
     }
     symlink(&target, "/etc/localtime")
         .with_context(|| format!("create /etc/localtime -> {}", target.display()))
+}
+
+/// Dangling-by-design symlinks /dev/<class><n> -> host/<class><n>. sysfs
+/// enumeration only ever names nodes that exist on the host, so libraries that
+/// derive "/dev/" + DEVNAME resolve to the live host node, across replugs, with
+/// no hotplug events needed.
+fn create_usb_device_links(dev: &Path) -> Result<()> {
+    for class in USB_DEVICE_CLASSES {
+        for n in 0..USB_DEVICE_LINKS_PER_CLASS {
+            let name = format!("{class}{n}");
+            let target = Path::new(HOST_DEV_SUBDIR).join(&name);
+            let link = dev.join(&name);
+            symlink(&target, &link)
+                .with_context(|| format!("create {} -> {}", link.display(), target.display()))?;
+        }
+    }
+    Ok(())
 }
 
 /// Project path, mode, agent command, and explicit agent environment, written
@@ -284,9 +313,39 @@ fn parse_map_field(field: Option<&str>, line_no: usize, name: &str) -> Result<u6
 
 #[cfg(test)]
 mod tests {
-    use super::{agent_env_names_from_raw, append_env_line, subid_file_from_map};
+    use super::{
+        agent_env_names_from_raw, append_env_line, create_usb_device_links, subid_file_from_map,
+    };
     use std::ffi::{OsStr, OsString};
     use std::os::unix::ffi::OsStrExt;
+    use std::path::Path;
+
+    #[test]
+    fn usb_device_links_point_into_host_dev() {
+        let dev = std::env::temp_dir().join(format!(
+            "claudepod-entry-usb-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&dev).unwrap();
+        create_usb_device_links(&dev).unwrap();
+        assert_eq!(
+            std::fs::read_link(dev.join("hidraw0")).unwrap(),
+            Path::new("host/hidraw0")
+        );
+        assert_eq!(
+            std::fs::read_link(dev.join("ttyUSB63")).unwrap(),
+            Path::new("host/ttyUSB63")
+        );
+        assert!(std::fs::symlink_metadata(dev.join("ttyUSB64")).is_err());
+        assert_eq!(std::fs::read_dir(&dev).unwrap().count(), 128);
+        // Dangling until the host creates the node; that's the point.
+        assert!(!dev.join("hidraw0").exists());
+        std::fs::remove_dir_all(&dev).unwrap();
+    }
 
     #[test]
     fn subid_file_from_outer_keep_id_map() {

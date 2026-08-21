@@ -26,6 +26,11 @@ const STORE_LAYER_MOUNT_DIR: &str = "/nix/.l";
 // running kernel module's userspace libs (libcuda.so.1 and friends).
 const OPENGL_DRIVER_DIR: &str = "/run/opengl-driver";
 const OPENGL_DRIVER_ENV: &str = "LD_LIBRARY_PATH=/run/opengl-driver/lib";
+// --usb: the usbfs tree is bound at its canonical path (live directory, so
+// hotplug renumbering just works); host /dev is bound at HOST_DEV_DIR for
+// class-driver nodes, which claudepod-entry symlinks into place.
+const USBFS_DIR: &str = "/dev/bus/usb";
+const HOST_DEV_DIR: &str = "/dev/host";
 const DEV_SHM_SIZE: &str = "2g";
 const NIX_RUN_ROOTS_EXPR: &str = r#"
 let
@@ -94,6 +99,11 @@ struct Args {
     /// read-only /run/opengl-driver, and LD_LIBRARY_PATH pointing at its lib dir.
     #[arg(long)]
     gpu: bool,
+
+    /// Pass host USB devices into the guest: live /dev/bus/usb, host /dev at
+    /// /dev/host, and /dev/hidraw*, /dev/ttyUSB* symlinks into it.
+    #[arg(long)]
+    usb: bool,
 
     /// Build the nix run-root manifest cache before starting.
     #[arg(long)]
@@ -214,6 +224,18 @@ fn main() -> Result<()> {
         let dir = Path::new(OPENGL_DRIVER_DIR);
         volumes.push(volume_spec(dir, dir, Some("ro"))?);
     }
+    if args.usb {
+        let usbfs = Path::new(USBFS_DIR);
+        if !usbfs.is_dir() {
+            bail!("--usb: {} not found", usbfs.display());
+        }
+        volumes.push(volume_spec(usbfs, usbfs, None)?);
+        volumes.push(volume_spec(
+            Path::new("/dev"),
+            Path::new(HOST_DEV_DIR),
+            None,
+        )?);
+    }
     for spec in &args.extra_volumes {
         volumes.push(extra_volume_spec(spec)?);
     }
@@ -247,6 +269,9 @@ fn main() -> Result<()> {
             .map(|device| device.to_string_lossy())
             .collect();
         println!("  GPU: {}", names.join(" "));
+    }
+    if args.usb {
+        println!("  USB: {USBFS_DIR}, host /dev at {HOST_DEV_DIR}");
     }
     println!();
 
@@ -311,6 +336,9 @@ fn main() -> Result<()> {
     }
     if args.verbose {
         command.arg("-e").arg("CLAUDEPOD_VERBOSE=1");
+    }
+    if args.usb {
+        command.arg("-e").arg("CLAUDEPOD_USB=1");
     }
     if let Some(timezone) = &timezone {
         command

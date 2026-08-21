@@ -42,8 +42,8 @@ nix run github:xzrq-net/claudepod#gptpod
 ## Commands
 
 ```text
-claudepod [-s] [-V] [--sandbox-home DIR] [--gpu] [-e NAME[=VALUE]]... [--host-port PORT|GUEST:HOST[/udp]]... [-p PORT|HOST:GUEST[/udp]]... [-v path] [-v host:guest]... [--] [command [arg]...]
-gptpod    [-s] [-V] [--sandbox-home DIR] [--gpu] [-e NAME[=VALUE]]... [--host-port PORT|GUEST:HOST[/udp]]... [-p PORT|HOST:GUEST[/udp]]... [-v path] [-v host:guest]... [--] [command [arg]...]
+claudepod [-s] [-V] [--sandbox-home DIR] [--gpu] [--usb] [-e NAME[=VALUE]]... [--host-port PORT|GUEST:HOST[/udp]]... [-p PORT|HOST:GUEST[/udp]]... [-v path] [-v host:guest]... [--] [command [arg]...]
+gptpod    [-s] [-V] [--sandbox-home DIR] [--gpu] [--usb] [-e NAME[=VALUE]]... [--host-port PORT|GUEST:HOST[/udp]]... [-p PORT|HOST:GUEST[/udp]]... [-v path] [-v host:guest]... [--] [command [arg]...]
 ```
 
 Options:
@@ -59,6 +59,15 @@ Options:
   RUNPATH. Note the guest Nix store is tmpfs: put CUDA toolchains in
   `extraGuestPackages` (or build them on the host) rather than fetching them
   per session.
+- `--usb`: pass host USB devices into the guest. Binds `/dev/bus/usb` at the
+  same path and host `/dev` at `/dev/host`; both are live directories, so
+  hotplug renumbering is reflected without events. `/dev/hidraw0..63` and
+  `/dev/ttyUSB0..63` are pre-created as symlinks into `/dev/host`, so
+  libraries that enumerate via sysfs and open `/dev/<name>` work unchanged.
+  Authorize devices by uid on the host (udev `TAG+="uaccess"` or `OWNER=`):
+  host supplementary groups such as `dialout` do not reach the guest. Hotplug
+  *events* (libusb hotplug callbacks, `udevadm monitor`) are not delivered to
+  the guest; polling works.
 - `-e NAME`, `--env NAME`: forward `NAME` from the host environment into the
   guest session when it is set.
 - `-e NAME=VALUE`, `--env NAME=VALUE`: set `NAME` to `VALUE` in the guest
