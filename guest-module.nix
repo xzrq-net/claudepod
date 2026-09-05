@@ -21,6 +21,13 @@
   # hook in /etc/claude-code/managed-settings.json (sourced through
   # CLAUDE_ENV_FILE) and into codex via /etc/profile (codex runs `bash -lc`).
   # Failure modes are loud on stderr but never fail the shell.
+  #
+  # The agent process itself is started without direnv loaded (see
+  # claudepodShell), so every command is a fresh load from the shell's own
+  # env. direnv snapshots the env it first sees and reverts to it on reload;
+  # a snapshot taken before the agent started would drop whatever the agent
+  # adds to its shells afterwards, e.g. Claude Code's plugin bin/ dirs. A
+  # fresh load costs ~30 ms with a warm nix-direnv cache.
   agentDevshell = pkgs.writeText "agent-devshell.sh" ''
     if command -v direnv >/dev/null 2>&1; then
       _de_out=$(timeout 60 direnv export bash 2>/dev/null); _de_rc=$?
@@ -72,9 +79,11 @@
       esac
     fi
 
+    # Deliberately no direnv here: the agent must not inherit loaded direnv
+    # state (see agentDevshell). Give it devshell tools for its own process,
+    # e.g. MCP servers, by wrapping those commands in `direnv exec`.
     exec ${pkgs.bashInteractive}/bin/bash --login -c '
       cd "$1"
-      eval "$(${pkgs.direnv}/bin/direnv export bash)" || true
       shift
       exec "$@"
     ' claudepod "$PROJECT" "''${COMMAND[@]}"
